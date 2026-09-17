@@ -6,9 +6,14 @@
   "iconUrl": "https://dummyimage.com/100x100/0066ff/fff&text=YuE2",
   "config": {
     "runsOn": "GPU",
-    "containerDiskInGb": 20,
+    "containerDiskInGb": 30,
     "gpuIds": "ADA_24",
     "gpuCount": 1,
     "allowedCudaVersions": ["12.8", "12.7", "12.6", "12.5", "12.4"]
+  },
+  "_notes": {
+    "containerDiskInGb": "The built image measures 12.9 GB, dominated by the nvidia CUDA pip wheels (4.3 GB) that torch pulls in, plus torch itself (1.8 GB). 20 GB left too little headroom for the pull/unpack phase, so this is 30. No model weights are in the image — verified clean from inside the container. Stage 03 adds isolated venvs for SheetSage2 and Qwen3-ASR (their own torch 2.8.0 and 2.6.0), which will grow the image substantially; expect to raise this again.",
+    "gpuIds": "ADA_24 is the locked 24 GB RTX 4090-class tier. Peak measured VRAM is 14.08 GiB with one song at a time.",
+    "networkVolume": "Not expressible here — attach a volume mounted at /runpod-volume when creating the endpoint. The volume is datacenter-specific, so the endpoint and volume must share a DC."
   }
 }

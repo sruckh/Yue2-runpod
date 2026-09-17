@@ -16,8 +16,12 @@ Awaiting the stage's `## Human check`, which needs a GPU.
 | Format (`ruff format --check`) | clean |
 | Container layout (`import config, schema, storage, boot, handler`) | OK |
 | Dockerfile syntax (BuildKit `--check`) | no warnings |
-| Docker image build | completes; image builds locally |
-| ICM audit | OK (1 expected warning, see below) |
+| Docker image build | **built: 12.9 GB**, `yue2-worker:stage02` |
+| In-container import + wheel check | **passed** — flat layout resolves and `yue2_infer 0.1.5` imports inside the image |
+| No weights baked into the image | **verified from inside the container** — no `*.safetensors` anywhere |
+| API contract vs the real wheel | verified by AST — all kwargs valid; see below |
+| ICM audit | OK (0 warnings) |
+| Pushed to GitHub | `github.com/sruckh/Yue2-runpod`, private, `main` @ `442c209` |
 | End-to-end generation | **not possible here** — no GPU, no RunPod key, no B2 credentials |
 
 ## What was built
@@ -120,17 +124,43 @@ volume. None exist on the machine this was built on.
 
 ## Adversarial review
 
-Two independent critics reviewed the worker with fresh context and no visibility
-into the builder's reasoning:
+Two critics were spawned with fresh context and no visibility into the builder's
+reasoning:
 
 - **Architecture critic** — blind A/B against `runpod-workers/worker-faster_whisper`
-  and `worker-comfyui`, labels stripped, order randomized.
-- **API critic** — every pipeline call checked against the real `yue2_infer-0.1.5`
-  wheel source unpacked from the model repo.
+  and `worker-comfyui`, labels stripped, order randomized per round.
+- **API critic** — instructed to check every pipeline call against the real
+  `yue2_infer-0.1.5` wheel source unpacked from the model repo.
 
-Findings and their resolution are recorded in the activity log below as they
-land; the boot-path improvements above (items 2 and 3 of the deviations) came
-from this pass reading `yue2.storage.resolve_model` and `MODEL_FILES` directly.
+**Neither critic returned a report.** Both were spawned, both ran (the API critic
+was observed writing and executing probe scripts against the wheel), and both
+went idle without delivering findings, despite three requests. This is recorded
+as a failure of the review step, not as a clean bill of health — a critic that
+does not report is not a critic that found nothing.
+
+**In its place, the builder ran the API-contract check directly** against the
+same ground truth, by AST rather than regex, so it is reproducible:
+
+| Check | Method | Result |
+|---|---|---|
+| Call sites into the pipeline | AST walk of `handler.py` | exactly one: `pipe(**call_kwargs)` |
+| Kwargs vs `SongRequest` fields | AST of `protocol.py` | `style`, `lyrics`, `cot`, `seed`, `abc`, `cfg_scale` — all valid |
+| `from_pretrained` keywords | AST of `pipeline.py` | `progress`/`local_files_only` accepted directly; `device`/`memory_budget_gib` reach `__init__` via `**kwargs` |
+| `save_artifacts` output | AST + source of `SongResult`/`SymbolicPlan` | writes `audio.flac` and calls `plan.save()`, which writes `score.abc` |
+
+An earlier pass of this same check reported two failures. Both were false
+positives in the check itself — a loose regex that matched the *response* dict
+instead of the call kwargs, and a pattern that missed a `.write_bytes` call. They
+are noted because a self-run verification that cannot be wrong is not a
+verification; the first pattern was wrong twice before the AST version was
+trustworthy.
+
+**What this does not substitute for.** The architecture critic's blind A/B never
+happened, so no independent comparison against the RunPod bar was ever returned.
+The worker has been read against that bar by its builder (boot/caching, error
+taxonomy, response shape all follow it), but self-assessment is not the
+independent judgment the contest was set up to produce. Treat the architecture
+comparison as outstanding.
 
 ## Open question carried forward
 

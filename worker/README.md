@@ -91,8 +91,18 @@ generation is real.
 | GPU | RTX 4090 24 GB (ADA_24), ×1 | Peak is 14.08 GiB; one song at a time |
 | Workers | min 0, scale after warm | Cold start pays the weight download |
 | Job timeout | ≥ 30 min | ~71 s generation for a 3.6-min song, plus slow boots |
-| Container disk | 20 GB | Image only; weights live on the volume |
+| Container disk | **30 GB** | The image alone is 12.9 GB — see below |
 | Network volume | mounted at `/runpod-volume` | One datacenter — the volume is DC-specific |
+
+The image measures **12.9 GB**, dominated by the `nvidia` CUDA pip wheels (4.3 GB)
+that `torch` pulls in, plus `torch` itself (1.8 GB). The original 20 GB container
+disk left too little room for the pull/unpack phase, so the endpoint config asks
+for 30. **No model weights are baked in** — that is verified from inside the built
+container, not assumed.
+
+Stage 03 will grow this considerably: SheetSage2 and Qwen3-ASR each get their own
+venv with their own torch (2.8.0 and unpinned respectively), so expect to raise
+the container disk again.
 
 ### Environment
 

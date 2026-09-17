@@ -57,8 +57,10 @@ def test_hub_json_matches_the_documented_gpu_tier() -> None:
     assert hub["type"] == "serverless"
     assert config["gpuCount"] == 1
     assert config["gpuIds"] == "ADA_24", "the locked tier is a 24 GB RTX 4090-class card"
-    # A 3.6-minute song plus a cold-start download needs real headroom.
-    assert config["containerDiskInGb"] >= 20
+    # The built image measures 12.9 GB (nvidia CUDA wheels + torch), so the
+    # container disk must clear that with room for the pull/unpack phase. 20 GB
+    # was the original value and left too little headroom.
+    assert config["containerDiskInGb"] >= 25, "container disk must clear the 12.9 GB image with headroom"
 
 
 def test_model_repos_named_in_docs_exist_as_constants() -> None:
