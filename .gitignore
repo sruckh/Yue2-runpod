@@ -1,0 +1,29 @@
+# graft's local graph cache — regenerable, not committed (run `graft build`).
+/graft/
+
+# --- Agent state (regenerated per session; never committed) -------------------
+.outline/
+.serena/
+.goals/
+.claude/
+.tokensave/
+.ignore
+
+# --- Python -------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+env/
+
+# --- Local state and secrets --------------------------------------------------
+# Real credentials go on the RunPod endpoint template. `.env.example` is
+# committed; `.env` never is.
+.env
+.env.*
+!.env.example
+*.log

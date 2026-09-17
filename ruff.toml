@@ -1,0 +1,29 @@
+# Lint config for the YuE2 worker.
+#
+# `worker/` uses flat imports (`import config`, not `from worker import config`)
+# because the container runs `python -u /app/handler.py` with `/app` as the
+# working directory — exactly the layout of the reference RunPod worker. That
+# convention is load-bearing, so the E402 "module level import not at top"
+# exemption below is required rather than sloppy: `handler.py` must call
+# `apply_hf_env()` before importing anything that touches HuggingFace.
+
+line-length = 120
+target-version = "py312"
+
+[lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "C4", "SIM", "RUF"]
+ignore = [
+  "E501",   # line length is handled by the formatter
+  "B008",   # function call in default arg — used by dataclass field factories
+  "RUF012", # mutable class attr needs ClassVar — our fakes are intentionally mutable
+]
+
+[lint.per-file-ignores]
+# FakeS3Client mirrors boto3's real CamelCase parameter names (`Params`,
+# `ExpiresIn`) so the double stays signature-compatible; renaming them would
+# make the fake diverge from the thing it stands in for.
+"tests/conftest.py" = ["E402", "SIM117", "N803"]
+"tests/*" = ["E402", "SIM117"]
+
+[lint.isort]
+known-first-party = ["config", "schema", "storage", "boot", "handler", "modes"]

@@ -1,0 +1,33 @@
+{
+  "tests": [
+    {
+      "name": "create_default_cot",
+      "input": {
+        "style": "City Pop, upbeat, danceable, groovy bass, electric guitar, synth, energetic, joyful, neon city night",
+        "lyrics": "[Intro]\n\n[Verse]\nStreetlights blink, watching every passer-by\nSidewalks hum a tune, the rhythm riding high\n\n[Chorus]\nTonight we stay awake, nothing here to break\nThe city sings along, for the city's sake",
+        "cot": "full",
+        "seed": 12300
+      }
+    },
+    {
+      "name": "create_melody_only",
+      "input": {
+        "style": "Jazz-funk, warm lead vocal, Rhodes piano, electric bass, tight drums",
+        "lyrics": "[Verse]\nSlow down, let the evening take its time\n[Chorus]\nWe are the sound of midnight",
+        "cot": "melody",
+        "seed": 831001,
+        "cfg_scale": 1.2
+      }
+    },
+    {
+      "name": "create_with_supplied_abc",
+      "input": {
+        "style": "Folk ballad, fingerpicked guitar, close vocal",
+        "lyrics": "[Verse]\nThe road was long and the night was cold",
+        "cot": "full",
+        "seed": 42,
+        "abc": "X:1\nT:Supplied melody\nM:4/4\nL:1/4\nK:C\nC D E F | G A G F | E D C2 |"
+      }
+    }
+  ]
+}

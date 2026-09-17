@@ -1,0 +1,42 @@
+# Build context for the worker image.
+#
+# The Dockerfile only needs `worker/`. Everything else in this repo is either
+# agent state, reference material, or the ICM scaffolding — none of it belongs in
+# a service image, and a smaller context means a faster build.
+
+# Agent state and tooling caches
+.serena/
+.outline/
+.goals/
+graft/
+.tokensave/
+.claude/
+.ignore
+
+# Reference material — read by people and agents, not shipped
+stages/
+shared/
+_config/
+setup/
+RESEARCH-NOTES.md
+*.md
+!worker/README.md
+!worker/AGENTS.md
+
+# Python build artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+
+# Tests and CI: run in the pipeline, not in the runtime image
+tests/
+.github/
+
+# Local state that must never reach an image layer
+.env
+.env.*
+!.env.example
+*.log

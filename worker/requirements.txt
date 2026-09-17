@@ -1,0 +1,28 @@
+# Runtime dependencies — YuE2 RunPod Serverless worker.
+#
+# Every pin here is exact. `_config/conventions.md` forbids loose ranges on
+# purpose: these wheels are known to conflict across model families, and a
+# resolver left to its own judgement will happily pick a combination that
+# imports and then fails mid-generation.
+#
+# The authoritative source for the first eight pins is the `yue2_infer-0.1.5`
+# wheel's own METADATA (`Requires-Dist`), read directly from the HF repo — not
+# the model card, not shared/dependency-pins.md, both of which omit safetensors,
+# tiktoken and soundfile. See output/create-mode-worker.md for that correction.
+#
+# PyTorch is served from the CUDA 12.8 index; `torch==2.10.0` on plain PyPI is a
+# CPU-only build and would install cleanly and then fail on `device="cuda"`.
+--extra-index-url https://download.pytorch.org/whl/cu128
+
+torch==2.10.0
+transformers==4.57.6
+huggingface-hub==0.36.2
+safetensors==0.7.0
+tiktoken==0.12.0
+numpy==2.2.6
+soundfile==0.13.1
+accelerate==1.13.0
+
+# Worker transport and egress. Not pinned by the model wheel — these are ours.
+runpod==1.12.0
+boto3==1.43.97
