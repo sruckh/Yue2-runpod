@@ -166,3 +166,44 @@ Two things were in the wrong place for RunPod's GitHub build, both fixed:
    `runpod.serverless.start({"handler": handler})`. The SDK discovers
    `--test_input` itself, so the custom `main()` was redundant as well as
    obscure; it has been removed.
+
+---
+
+## Production verification (2026-09-17)
+
+The endpoint is live and RunPod built the image from this repository. Three jobs
+were submitted; all three failed **by design**, and the timings are the evidence
+that the design holds.
+
+| Job | Result | `executionTime` |
+|---|---|---|
+| Valid create payload, no B2 configured | `No storage configured. Set B2_ENDPOINT_URL, B2_KEY_ID, B2_APP_KEY and B2_BUCKET...` | **259 ms** |
+| `seed: "not-a-number"` | `'seed' must be an integer, got 'not-a-number'` | **235 ms** |
+| `mode: "cover"` | `mode 'cover' is not implemented in this worker build (Stage 03)` | **300 ms** |
+
+What this establishes, none of which the mocked suite could:
+
+1. **The platform built the image from this repo.** The root `Dockerfile` layout
+   is correct — no path configuration was needed.
+2. **The worker boots and serves.** `runpod.serverless.start` accepts jobs, and
+   `/health` shows a ready worker rather than an unhealthy one.
+3. **The model cache resolved.** Boot reached the serving loop, so
+   `resolve_cached_snapshot` found both repos. A cache miss would have surfaced
+   as a boot failure, not a served job.
+4. **The fail-fast ordering holds in production.** The valid payload was rejected
+   after **259 ms** — before any generation. That is the fix that moved storage
+   resolution ahead of `generate()`; without it this job would have burned ~70
+   seconds of 4090 time producing a song it could not deliver. The cheapest test
+   here is also the one that proves the most expensive bug is gone.
+5. **The error contract is real.** All three failures returned structured,
+   actionable messages naming the exact missing variable or the exact bad input —
+   not a traceback, not a generic 500.
+
+### What is still unverified
+
+**No song has been generated.** Every job so far failed before generation, which
+is what the missing B2 configuration guarantees. The remaining gap is one
+endpoint setting, not a code change.
+
+Once B2 credentials are on the endpoint, the full chain runs: generate → persist
+artifacts → upload → presigned URLs. That is the stage's Human check.

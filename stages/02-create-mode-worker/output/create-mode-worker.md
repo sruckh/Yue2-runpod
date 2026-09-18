@@ -21,6 +21,9 @@ Awaiting the stage's `## Human check`, which needs a GPU.
 | No weights baked into the image | **verified from inside the container** — no `*.safetensors` anywhere |
 | API contract vs the real wheel | verified by AST — all kwargs valid; see below |
 | ICM audit | OK (0 warnings) |
+| **Image build on RunPod** | **succeeded** — built by the platform from this repo, not locally |
+| **Endpoint live** | `/health` reports `workers: ready 1, idle 1` — the module imported and booted |
+| **Error paths in production** | **3/3 verified**, each in ~250–300 ms with no GPU time (see below) |
 | Pushed to GitHub | `github.com/sruckh/Yue2-runpod`, private, `main` @ `442c209` |
 | End-to-end generation | **not possible here** — no GPU, no RunPod key, no B2 credentials |
 
@@ -134,6 +137,20 @@ enough: an unrelated refactor moved the boot into module scope, which turned the
 import smoke test into a weight download. The guard makes the rule a build-time
 assertion, so the next such refactor fails loudly and cheaply instead of
 producing a fat image that deploys fine and costs storage forever.
+
+## Production verification
+
+The image built on RunPod's platform and the endpoint is live. Three jobs were
+submitted and all three failed by design, in 235–300 ms each — which is the
+evidence that matters: the fail-fast ordering holds in production, so a
+misconfigured worker costs milliseconds rather than 70 seconds of GPU time.
+
+Full evidence, including what each failure establishes:
+**`review-findings.md`**.
+
+**Still unverified: no song has been generated.** Every job failed before
+generation, which the missing B2 configuration guarantees. The remaining gap is
+one endpoint setting, not a code change.
 
 ## What this stage does *not* prove
 

@@ -26,4 +26,15 @@ env/
 .env
 .env.*
 !.env.example
+
+# Agent/tooling credential files that live in the working tree. Named
+# explicitly rather than by a broad pattern, so the list stays auditable —
+# a `git add -A` must never be able to stage a live key.
+.runpod_key
+*_api_key
+*_token
+credentials.json
+
+# Editor/tool state
+.mcp.json
 *.log
