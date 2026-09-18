@@ -96,6 +96,9 @@ class SongParameters:
     #: separately" — a listener usually knows them better than an ASR pass over a
     #: full mix does, so an explicit lyric wins over the transcription.
     lyrics_supplied: bool = False
+    #: The caller asked for no vocals. Carried so the response can report it and
+    #: so `to_request_json` does not have to infer it from the placeholder.
+    instrumental: bool = False
 
     def to_request_json(self) -> dict[str, Any]:
         """The subset we echo back in the response and persist beside the audio."""
@@ -107,6 +110,7 @@ class SongParameters:
             "id": self.id,
             "has_abc": self.abc is not None,
             "lyrics_chars": len(self.lyrics),
+            "instrumental": self.instrumental,
         }
 
 
@@ -156,6 +160,38 @@ def _coerce_cfg_scale(value: Any) -> float | None:
     return scale
 
 
+#: What `instrumental: true` puts in the lyrics slot, and the reason it exists.
+#:
+#: **YuE2 has no instrumental mode.** `yue2_infer.protocol.SongRequest` declares
+#: `lyrics: str` as a required field, the prompt is always assembled as
+#: `[Tags]\n{style}\n[Lyrics]\n{lyrics}\n` at every CoT, and the word
+#: "instrumental" does not appear anywhere in the wheel. The authors' own skill
+#: describes every generation path as `style + lyrics`.
+#:
+#: So a caller wanting no vocals has to put *something* in the slot. This is that
+#: something: a single section tag with no words, which matches the bracketed-tag
+#: convention of the authors' own example prompt (`[verse]`, `[chorus]`).
+#:
+#: **Unverified.** Whether this yields an instrumental, or merely quiet or
+#: mumbled vocals, has not been checked against real generation — it cannot be
+#: without a GPU. It is a defined input rather than a promise, and a run on real
+#: hardware should decide whether it stays or is replaced.
+INSTRUMENTAL_LYRICS = "[instrumental]"
+
+
+def _resolve_instrumental(value: Any) -> bool:
+    """`instrumental` is a boolean, and `bool("false")` is `True`.
+
+    Coerced strictly for the same reason `seed` rejects booleans: a caller
+    sending the string `"false"` would otherwise silently get an instrumental.
+    """
+    if value is None:
+        return False
+    if not isinstance(value, bool):
+        raise ValidationError(f"'instrumental' must be true or false, got {value!r}")
+    return value
+
+
 def _resolve_cot(value: Any) -> str:
     cot = DEFAULT_COT if value is None else value
     if not isinstance(cot, str) or cot not in VALID_COT:
@@ -189,9 +225,25 @@ def validate_job(job: Mapping[str, Any] | None) -> SongParameters:
     #
     # `validate_mode_inputs` has already confirmed the mode is one this worker
     # knows, so an unrecognised mode never reaches here.
+    instrumental = _resolve_instrumental(raw.get("instrumental"))
     lyrics_raw = raw.get("lyrics")
+
+    # Asking for no vocals *and* supplying words is a contradiction, not a
+    # request to be interpreted — one of the two is a mistake, and guessing
+    # which would silently produce the wrong song.
+    if instrumental and lyrics_raw not in (None, ""):
+        raise ValidationError(
+            "'instrumental' is true but 'lyrics' was supplied; send one or the other. "
+            "Omit 'lyrics' for an instrumental, or set 'instrumental' false to use the words."
+        )
+
     if mode == COVER:
+        # A cover's words come from the recording when the caller supplies none.
         lyrics = _require_text(lyrics_raw, "lyrics") if lyrics_raw is not None else ""
+    elif instrumental:
+        # See INSTRUMENTAL_LYRICS: YuE2 has no instrumental mode, so the slot is
+        # filled rather than left empty.
+        lyrics = INSTRUMENTAL_LYRICS
     else:
         lyrics = _require_text(lyrics_raw, "lyrics")
     cot = _resolve_cot(raw.get("cot"))
@@ -248,6 +300,7 @@ def validate_job(job: Mapping[str, Any] | None) -> SongParameters:
         id=request_id,
         source_audio=str(source_audio) if source_audio is not None else None,
         lyrics_supplied=lyrics_supplied,
+        instrumental=instrumental,
     )
 
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 import pytest
 
 from schema import (
+    INSTRUMENTAL_LYRICS,
     MissingInputError,
     ValidationError,
     validate_job,
@@ -215,3 +216,113 @@ def test_to_request_json_omits_full_text() -> None:
     assert "lyrics" not in echoed
     assert echoed["lyrics_chars"] == len(VALID["lyrics"])
     assert echoed["has_abc"] is True
+
+
+# =============================================================================
+# instrumental — a defined input, not a promise
+# =============================================================================
+#
+# YuE2 has no instrumental mode. `yue2_infer.protocol.SongRequest` declares
+# `lyrics: str` as required, the prompt is always `[Tags]\n{style}\n[Lyrics]\n
+# {lyrics}\n` at every CoT, and the word "instrumental" appears nowhere in the
+# wheel — verified by extracting it. The authors' own skill describes every path
+# as `style + lyrics`.
+#
+# So a caller wanting no vocals has to put something in the slot. `instrumental`
+# is that something, and these tests pin the input contract. Whether the *audio*
+# is instrumental is a separate question, answerable only on a GPU.
+
+
+def test_instrumental_fills_the_lyrics_slot() -> None:
+    params = validate_job({"input": {"style": "lofi", "instrumental": True}})
+    assert params.instrumental is True
+    assert params.lyrics == INSTRUMENTAL_LYRICS
+    assert params.lyrics.strip(), "the slot must not be empty — the prompt always carries it"
+
+
+def test_the_placeholder_is_a_section_tag_not_words() -> None:
+    """It matches the bracketed-tag convention of the authors' own example.
+
+    Their skill says to put "section tags and actual words" in `lyrics`, and
+    their example prompt uses `[verse]` / `[chorus]`. A single wordless tag is
+    the closest thing to 'no words' the format has.
+    """
+    assert INSTRUMENTAL_LYRICS.startswith("[")
+    assert INSTRUMENTAL_LYRICS.endswith("]")
+    # No words outside the brackets.
+    assert INSTRUMENTAL_LYRICS[1:-1].replace(" ", "").isalpha()
+
+
+def test_instrumental_defaults_to_false() -> None:
+    params = validate_job({"input": {"style": "lofi", "lyrics": "[verse]\nhi"}})
+    assert params.instrumental is False
+
+
+def test_str_is_not_a_boolean() -> None:
+    """`bool("false")` is `True`, so the string must be rejected, not coerced.
+
+    Same reasoning as `seed`, where `int(True) == 1` would have silently given a
+    seed of 1. A caller sending `"false"` and receiving an instrumental is the
+    kind of failure that only shows up in the audio.
+    """
+    for value in ("false", "true", "0", "", 1, 0):
+        with pytest.raises(ValidationError):
+            validate_job({"input": {"style": "lofi", "instrumental": value, "lyrics": "x"}})
+
+
+def test_instrumental_with_lyrics_is_a_contradiction() -> None:
+    """Not interpreted — refused. One of the two is a mistake.
+
+    Guessing which would silently produce the wrong song: the caller either
+    wanted words they just sent, or wanted no vocals and sent words by copy-paste.
+    """
+    with pytest.raises(ValidationError) as excinfo:
+        validate_job({"input": {"style": "lofi", "instrumental": True, "lyrics": "real words"}})
+    message = str(excinfo.value)
+    assert "instrumental" in message and "lyrics" in message
+    assert "one or the other" in message, "the error must say what to do, not just what is wrong"
+
+
+def test_an_empty_lyrics_string_is_not_a_contradiction() -> None:
+    """`lyrics: ""` alongside `instrumental: true` is redundant, not conflicting.
+
+    Some clients default optional strings to empty. Refusing that would make the
+    flag unusable from exactly the callers most likely to want it, so an empty
+    string is treated as absent while a non-empty one is a real conflict.
+    """
+    params = validate_job({"input": {"style": "lofi", "instrumental": True, "lyrics": ""}})
+    assert params.instrumental is True
+    assert params.lyrics == INSTRUMENTAL_LYRICS
+
+
+def test_instrumental_rejects_lyrics_but_accepts_none() -> None:
+    """The boundary, stated once: None and "" are absent; anything else is words."""
+    assert validate_job({"input": {"style": "s", "instrumental": True, "lyrics": None}}).instrumental
+    with pytest.raises(ValidationError):
+        validate_job({"input": {"style": "s", "instrumental": True, "lyrics": " "}})
+
+
+def test_instrumental_is_reported_in_the_echoed_request() -> None:
+    """The response records it, so a caller can tell what was generated.
+
+    Without this, `instrumental: true` and a caller-passing-`[instrumental]` are
+    indistinguishable after the fact — and the persisted `request.json` is the
+    only durable record of what was asked for.
+    """
+    params = validate_job({"input": {"style": "lofi", "instrumental": True}})
+    assert params.to_request_json()["instrumental"] is True
+    other = validate_job({"input": {"style": "lofi", "lyrics": "words"}})
+    assert other.to_request_json()["instrumental"] is False
+
+
+def test_cover_still_derives_lyrics_when_none_are_supplied() -> None:
+    """The flag must not disturb the one mode that legitimately has no lyrics.
+
+    A cover with no lyrics and no words relies on transcription; adding
+    `instrumental` must not pre-empt that with the placeholder.
+    """
+    params = validate_job(
+        {"input": {"mode": "cover", "style": "lofi", "source_audio": "https://example.invalid/a.flac"}}
+    )
+    assert params.lyrics == "", "cover leaves the slot empty for the transcription to fill"
+    assert params.instrumental is False
