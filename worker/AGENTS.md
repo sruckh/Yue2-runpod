@@ -32,6 +32,24 @@ HuggingFace.** The cache location is read at import time; getting this order
 wrong writes a 12 GB download to the container disk and fails there rather
 than here. The `# noqa: E402` on the imports below it is load-bearing.
 
+### Models come from RunPod's cache, then the network volume
+
+Resolution order, and the paths are **RunPod's, not ours**:
+
+1. RunPod's **cached-models** feature mounts models at
+   `{volume}/huggingface-cache/hub` in the standard HF hub layout.
+   `resolve_cached_snapshot()` reads that — via `refs/main`, falling back to any
+   snapshot directory.
+2. If a repo is absent, download it with **`cache_dir=`** into that same root.
+
+Do not use `local_dir=` in `snapshot_download`. It produces a flat layout the
+platform's cache cannot see, so the cache is ignored and every start
+re-downloads 12 GB. That shipped once; `tests/test_boot.py` pins `cache_dir` and
+asserts `local_dir` is never passed.
+
+Never bake weights into the image (locked decision 4). The root `Dockerfile`
+asserts this at build time.
+
 ### Every version is an exact pin
 
 `requirements.txt` carries `==` on every line. These wheels are known to conflict
@@ -124,7 +142,7 @@ temporarily, not even for a test.
 ## Verification
 
 ```bash
-python -m pytest tests/ -q                              # 173 tests, no GPU, no network
+python -m pytest tests/ -q                              # 187 tests, no GPU, no network
 ruff check worker tests && ruff format --check worker tests
 python -c "import config, schema, storage, boot, handler"   # from worker/
 ```

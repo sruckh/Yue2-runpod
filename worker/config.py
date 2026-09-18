@@ -103,44 +103,85 @@ class StorageConfig:
 
 @dataclass(frozen=True)
 class CacheConfig:
-    """Where model weights live. A RunPod network volume, not the image."""
+    """Where model weights live — RunPod's model cache, on the network volume.
+
+    Two mechanisms, in priority order:
+
+    1. **RunPod's cached-models feature.** Models declared in the endpoint's
+       "Cached models" configuration are downloaded by RunPod and mounted at
+       `{volume}/huggingface-cache/hub` in the standard HuggingFace cache
+       layout. This is the intended path: weights are already present when the
+       worker starts, and RunPod owns fetching them.
+
+    2. **Network-volume fallback.** If a repo is not in that cache — a model
+       RunPod was not told about, a new revision, a volume never warmed — the
+       worker downloads it into the *same* cache root, so the layout is
+       identical either way and the next start hits mechanism 1.
+
+    Both land in one HF cache tree, which is why resolution has a single
+    implementation (`boot.resolve_cached_snapshot`) rather than one per source.
+
+    These paths mirror RunPod's documented layout exactly. A worker that invents
+    its own directory (`local_dir=`) is invisible to the cache feature — how an
+    earlier version of this file ended up downloading weights into a layout
+    nothing else could read.
+    """
 
     #: Mount point of the network volume. RunPod mounts it here by convention.
     volume_root: Path = field(default_factory=lambda: Path(_env("VOLUME_ROOT", "/runpod-volume")))
-    #: HuggingFace hub cache inside the volume. Both HF repos share it so a
-    #: second cold start re-uses blobs already on disk.
-    hf_home: Path | None = None
-    #: Set true to forbid network access during model resolution — the correct
-    #: setting once a volume is warm, and the thing that proves caching works.
+    #: Forbid network access during model resolution. Once the RunPod cache is
+    #: populated this proves it works — a missing blob fails loudly rather than
+    #: silently re-downloading.
     local_files_only: bool = field(default_factory=lambda: _env_bool("HF_LOCAL_FILES_ONLY", False))
     hf_token: str | None = field(default_factory=lambda: os.environ.get("HF_TOKEN") or None)
 
-    def __post_init__(self) -> None:
-        if self.hf_home is None:
-            object.__setattr__(self, "hf_home", self.volume_root / "hf")
+    @property
+    def hf_home(self) -> Path:
+        """HF cache root's parent, per RunPod's documented layout."""
+        return self.volume_root / "huggingface-cache"
+
+    @property
+    def hub_cache(self) -> Path:
+        """The hub cache directory — where RunPod mounts cached models.
+
+        This is the exact path from RunPod's docs
+        (`/runpod-volume/huggingface-cache/hub`). Do not relocate it: the
+        platform writes here, and a worker reading anywhere else misses every
+        model the endpoint was configured to cache.
+        """
+        return self.hf_home / "hub"
 
     @property
     def models_dir(self) -> Path:
-        """Directory the container writes generated artifacts into, per job."""
+        """Where generated artifacts go, per job. Scratch, not cached data."""
         return self.volume_root / "scratch"
 
     def apply_hf_env(self) -> None:
-        """Point the HuggingFace libraries at the volume.
+        """Point the HuggingFace libraries at RunPod's cache. Call before any HF import.
 
-        Must run before anything imports `huggingface_hub`, which reads these
-        at import time. `handler.py` calls this as its first statement.
+        Must run before anything imports `huggingface_hub`, which reads these at
+        import time. `handler.py` calls this as its first statement — the
+        `# noqa: E402` on the imports below it is load-bearing.
         """
-        assert self.hf_home is not None
         os.environ["HF_HOME"] = str(self.hf_home)
-        os.environ["HUGGINGFACE_HUB_CACHE"] = str(self.hf_home / "hub")
-        # Keep the xet transfer cache on the volume too — it is the bulk of
-        # the bytes on a cold start. Assigned, not `setdefault`: if a base image
-        # happened to export this, `setdefault` would quietly leave the bulk of
-        # the download on the container disk, which is the exact failure this
-        # function exists to prevent.
+        os.environ["HF_HUB_CACHE"] = str(self.hub_cache)
+        # Keep the xet transfer cache on the volume too — it is the bulk of the
+        # bytes on a cold start. Assigned, not `setdefault`: if a base image
+        # exported this, `setdefault` would quietly leave the download on the
+        # container disk, the exact failure this function exists to prevent.
         os.environ["HF_XET_CACHE"] = str(self.hf_home / "xet")
         if self.hf_token:
             os.environ.setdefault("HF_TOKEN", self.hf_token)
+
+    def enable_offline_mode(self) -> None:
+        """Tell the HuggingFace libraries to resolve only from the local cache.
+
+        RunPod's documented pattern for workers using cached models. Called by
+        `boot` once the cache is known complete — *not* unconditionally, because
+        the network-volume fallback needs to download when a repo is absent.
+        """
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
 
 @dataclass(frozen=True)

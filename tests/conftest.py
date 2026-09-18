@@ -56,13 +56,57 @@ def _clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture
 def volume(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """A fake network volume, fully populated so `ensure_models` sees a warm cache."""
+    """An empty fake network volume — nothing cached yet.
+
+    Deliberately empty: most behaviours worth testing are about what happens
+    when the cache is *not* populated. Use `populate_runpod_cache` to simulate
+    the endpoint's cached-models feature having done its job.
+    """
     root = tmp_path / "volume"
-    (root / "models" / "YuE2-3B").mkdir(parents=True)
-    (root / "models" / "YuE2-Vae").mkdir(parents=True)
     (root / "scratch").mkdir(parents=True)
     monkeypatch.setenv("VOLUME_ROOT", str(root))
     return root
+
+
+#: The hub-cache path RunPod's cached-models feature mounts, relative to the volume.
+HUB_CACHE = Path("huggingface-cache") / "hub"
+
+
+def hub_cache_root(volume: Path) -> Path:
+    return volume / HUB_CACHE
+
+
+def snapshot_dir(volume: Path, repo_id: str, revision: str = "abc123") -> Path:
+    """The hub-cache snapshot directory for a repo, in RunPod's layout."""
+    org, name = repo_id.split("/", 1)
+    return hub_cache_root(volume) / f"models--{org}--{name}" / "snapshots" / revision
+
+
+def populate_runpod_cache(
+    volume: Path,
+    repo_id: str,
+    files: tuple[str, ...],
+    revision: str = "abc123",
+    *,
+    write_ref: bool = True,
+) -> Path:
+    """Simulate RunPod having cached a model at the documented path.
+
+    Creates the standard hub layout: `refs/main` naming a revision, and a
+    `snapshots/<rev>/` directory holding the files. That structure is the
+    contract — a worker reading anywhere else misses the platform's cache.
+    """
+    snapshot = snapshot_dir(volume, repo_id, revision)
+    snapshot.mkdir(parents=True, exist_ok=True)
+    for name in files:
+        target = snapshot / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"x")
+    if write_ref:
+        refs = snapshot.parent.parent / "refs"
+        refs.mkdir(parents=True, exist_ok=True)
+        (refs / "main").write_text(revision, encoding="utf-8")
+    return snapshot
 
 
 @pytest.fixture

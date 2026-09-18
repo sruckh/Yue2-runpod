@@ -1,9 +1,14 @@
-"""Boot tests — volume caching and pipeline load, with HuggingFace faked.
+"""Boot tests — RunPod's model cache first, network volume as fallback.
 
-The important behaviour here is the *warm* path: a worker restarting on an
-already-populated volume must not download anything. That is the entire point of
-the network-volume decision, and it is easy to regress by dropping the
-missing-files check and always calling `snapshot_download`.
+The behaviour under test is the *contract with the platform*: models declared in
+the endpoint's cached-models configuration are mounted at
+`{volume}/huggingface-cache/hub` in the standard HuggingFace cache layout, and a
+worker must read them from exactly there.
+
+An earlier version of `boot.py` downloaded with `local_dir=`, producing a tree in
+a layout only this worker understood. RunPod's cache could not see it, so every
+start re-downloaded 12 GB of weights the platform had already fetched — the
+caching never actually worked. These tests pin the layout so that cannot recur.
 """
 
 from __future__ import annotations
@@ -14,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from conftest import hub_cache_root, populate_runpod_cache, snapshot_dir
 
 import boot
 from boot import (
@@ -23,23 +29,33 @@ from boot import (
     ensure_models,
     health,
     install_model_wheel,
+    resolve_cached_snapshot,
 )
-from config import MODEL_WHEEL, CacheConfig
+from config import MODEL_REPO, MODEL_WHEEL, VAE_REPO, CacheConfig
 
 
 class SnapshotRecorder:
     """Stands in for `huggingface_hub.snapshot_download`."""
 
-    def __init__(self, *, populate: dict[str, tuple[str, ...]] | None = None) -> None:
+    def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
-        self.populate = populate or {}
 
-    def __call__(self, repo_id: str, local_dir: str, **kwargs: Any) -> str:
-        self.calls.append({"repo_id": repo_id, "local_dir": local_dir, **kwargs})
-        target = Path(local_dir)
-        for name in self.populate.get(repo_id, ()):
-            (target / name).write_bytes(b"x")
-        return local_dir
+    def __call__(self, repo_id: str, **kwargs: Any) -> str:
+        self.calls.append({"repo_id": repo_id, **kwargs})
+        # Mimic the real thing: write into the hub cache layout under cache_dir.
+        cache_dir = Path(kwargs["cache_dir"])
+        org, name = repo_id.split("/", 1)
+        snap = cache_dir / f"models--{org}--{name}" / "snapshots" / "deadbeef"
+        snap.mkdir(parents=True, exist_ok=True)
+        files = REQUIRED_MODEL_FILES if repo_id == MODEL_REPO else REQUIRED_VAE_FILES
+        for filename in files:
+            (snap / filename).write_bytes(b"x")
+        if repo_id == MODEL_REPO:
+            (snap / MODEL_WHEEL).write_bytes(b"PK")
+        refs = snap.parent.parent / "refs"
+        refs.mkdir(parents=True, exist_ok=True)
+        (refs / "main").write_text("deadbeef", encoding="utf-8")
+        return str(snap)
 
 
 @pytest.fixture
@@ -51,178 +67,300 @@ def fake_hf(monkeypatch: pytest.MonkeyPatch) -> SnapshotRecorder:
     return recorder
 
 
-def populate_volume(root: Path, *, model: bool = True, vae: bool = True) -> None:
-    for name, present, required in (
-        ("YuE2-3B", model, REQUIRED_MODEL_FILES),
-        ("YuE2-Vae", vae, REQUIRED_VAE_FILES),
-    ):
-        directory = root / "models" / name
-        directory.mkdir(parents=True, exist_ok=True)
-        if present:
-            for filename in required:
-                (directory / filename).write_bytes(b"x")
+def cached_all(volume: Path) -> None:
+    """Both repos present, as RunPod would leave them."""
+    populate_runpod_cache(volume, MODEL_REPO, (*REQUIRED_MODEL_FILES, MODEL_WHEEL))
+    populate_runpod_cache(volume, VAE_REPO, REQUIRED_VAE_FILES)
 
 
-# --- warm cache --------------------------------------------------------------
+# =============================================================================
+# Path resolution — the contract with the platform
+# =============================================================================
 
 
-def test_warm_volume_downloads_nothing(volume: Path, fake_hf: SnapshotRecorder) -> None:
-    populate_volume(volume)
+def test_cache_paths_match_runpods_documented_layout(volume: Path) -> None:
+    """The paths must be exactly RunPod's, not something equivalent-but-different."""
+    assert CacheConfig().hub_cache == volume / "huggingface-cache" / "hub"
+
+
+def test_resolves_a_model_runpod_cached(volume: Path) -> None:
+    expected = populate_runpod_cache(volume, MODEL_REPO, REQUIRED_MODEL_FILES)
+    assert resolve_cached_snapshot(MODEL_REPO) == expected
+
+
+def test_resolves_via_refs_main(volume: Path) -> None:
+    """`refs/main` is authoritative — a stale second snapshot must not win."""
+    populate_runpod_cache(volume, MODEL_REPO, REQUIRED_MODEL_FILES, revision="old")
+    newest = populate_runpod_cache(volume, MODEL_REPO, REQUIRED_MODEL_FILES, revision="current")
+    assert resolve_cached_snapshot(MODEL_REPO) == newest
+
+
+def test_falls_back_to_a_snapshot_without_refs(volume: Path) -> None:
+    """A cache with no `refs/` is still usable rather than fatal."""
+    snap = populate_runpod_cache(volume, MODEL_REPO, REQUIRED_MODEL_FILES, write_ref=False)
+    assert resolve_cached_snapshot(MODEL_REPO) == snap
+
+
+def test_absent_repo_resolves_to_none(volume: Path) -> None:
+    assert resolve_cached_snapshot(MODEL_REPO) is None
+
+
+def test_malformed_repo_id_is_rejected(volume: Path) -> None:
+    with pytest.raises(BootError, match="org/name"):
+        resolve_cached_snapshot("no-org-prefix")
+
+
+# =============================================================================
+# RunPod's cache is the primary path
+# =============================================================================
+
+
+def test_runpod_cache_hit_downloads_nothing(volume: Path, fake_hf: SnapshotRecorder) -> None:
+    """The whole point: if RunPod cached it, the worker must not fetch it again."""
+    cached_all(volume)
     report = ensure_models(CacheConfig())
 
     assert report.cache_hit is True
-    assert report.downloaded == []
-    assert set(report.already_present) == {"m-a-p/YuE2-3B", "m-a-p/YuE2-Vae"}
-    assert fake_hf.calls == [], "a warm cache must not hit the network"
+    assert fake_hf.calls == [], "a populated RunPod cache must not trigger a download"
+    assert set(report.from_cache) == {MODEL_REPO, VAE_REPO}
+    assert report.downloaded == {}
 
 
-def test_warm_report_names_no_downloads(volume: Path, fake_hf: SnapshotRecorder) -> None:
-    populate_volume(volume)
-    assert ensure_models(CacheConfig()).downloaded == []
+def test_cache_hit_reports_the_snapshot_paths(volume: Path, fake_hf: SnapshotRecorder) -> None:
+    cached_all(volume)
+    report = ensure_models(CacheConfig())
+    assert report.model_dir == snapshot_dir(volume, MODEL_REPO)
+    assert report.vae_dir == snapshot_dir(volume, VAE_REPO)
 
 
-# --- cold cache --------------------------------------------------------------
+# =============================================================================
+# Network-volume fallback
+# =============================================================================
 
 
-def test_cold_volume_downloads_both_repos(volume: Path, fake_hf: SnapshotRecorder) -> None:
-    fake_hf.populate = {
-        "m-a-p/YuE2-3B": REQUIRED_MODEL_FILES,
-        "m-a-p/YuE2-Vae": REQUIRED_VAE_FILES,
-    }
+def test_missing_model_falls_back_to_download(volume: Path, fake_hf: SnapshotRecorder) -> None:
+    populate_runpod_cache(volume, VAE_REPO, REQUIRED_VAE_FILES)  # VAE cached, model not
     report = ensure_models(CacheConfig())
 
-    assert report.cache_hit is False
-    assert set(report.downloaded) == {"m-a-p/YuE2-3B", "m-a-p/YuE2-Vae"}
-    assert [c["repo_id"] for c in fake_hf.calls] == ["m-a-p/YuE2-3B", "m-a-p/YuE2-Vae"]
+    assert [c["repo_id"] for c in fake_hf.calls] == [MODEL_REPO]
+    assert report.downloaded == {MODEL_REPO: snapshot_dir(volume, MODEL_REPO, "deadbeef")}
+    assert report.from_cache == {VAE_REPO: snapshot_dir(volume, VAE_REPO)}
 
 
-def test_partial_cache_refetches_only_the_incomplete_repo(volume: Path, fake_hf: SnapshotRecorder) -> None:
-    populate_volume(volume, model=True, vae=False)
-    fake_hf.populate = {"m-a-p/YuE2-Vae": REQUIRED_VAE_FILES}
+def test_fallback_uses_cache_dir_not_local_dir(volume: Path, fake_hf: SnapshotRecorder) -> None:
+    """The bug this whole module guards.
+
+    `local_dir=` produces a layout RunPod's cache feature cannot see, so the
+    platform's cache is ignored and every start re-downloads. `cache_dir=` is
+    what produces the shared hub layout.
+    """
+    ensure_models(CacheConfig())
+    for call in fake_hf.calls:
+        assert "cache_dir" in call, "must pass cache_dir"
+        assert "local_dir" not in call, "local_dir produces a layout RunPod cannot read"
+        assert call["cache_dir"] == str(volume / "huggingface-cache" / "hub")
+
+
+def test_fallback_writes_into_the_runpod_cache_root(volume: Path, fake_hf: SnapshotRecorder) -> None:
+    ensure_models(CacheConfig())
+    for repo_id in (MODEL_REPO, VAE_REPO):
+        resolved = resolve_cached_snapshot(repo_id)
+        assert resolved is not None
+        assert resolved.is_relative_to(hub_cache_root(volume))
+
+
+def test_second_call_after_fallback_needs_no_network(volume: Path, fake_hf: SnapshotRecorder) -> None:
+    """The fallback must warm the cache for the next start, not just this one."""
+    ensure_models(CacheConfig())
+    first = len(fake_hf.calls)
 
     report = ensure_models(CacheConfig())
-    assert report.downloaded == ["m-a-p/YuE2-Vae"]
-    assert report.already_present == ["m-a-p/YuE2-3B"]
-    assert [c["repo_id"] for c in fake_hf.calls] == ["m-a-p/YuE2-Vae"]
+    assert len(fake_hf.calls) == first, "the fallback did not populate the cache it reads"
+    assert report.cache_hit is True
 
 
-def test_incomplete_download_raises_with_repo_layout_hint(volume: Path, fake_hf: SnapshotRecorder) -> None:
-    """A repo that downloads but stays incomplete is a layout change, not a blip."""
-    fake_hf.populate = {}  # pretends to succeed but writes nothing
+def test_fallback_downloads_both_when_volume_is_cold(volume: Path, fake_hf: SnapshotRecorder) -> None:
+    report = ensure_models(CacheConfig())
+    assert set(report.downloaded) == {MODEL_REPO, VAE_REPO}
+    assert report.from_cache == {}
+
+
+# =============================================================================
+# Offline mode
+# =============================================================================
+
+
+def test_offline_mode_enabled_once_the_cache_is_verified(
+    volume: Path, fake_hf: SnapshotRecorder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RunPod's documented pattern: cache verified, then resolve offline."""
+    import os
+
+    monkeypatch.delenv("HF_HUB_OFFLINE", raising=False)
+    cached_all(volume)
+    ensure_models(CacheConfig())
+
+    assert os.environ["HF_HUB_OFFLINE"] == "1"
+    assert os.environ["TRANSFORMERS_OFFLINE"] == "1"
+
+
+def test_offline_mode_does_not_block_the_fallback(volume: Path, fake_hf: SnapshotRecorder) -> None:
+    """Enabling offline mode first would make the fallback impossible."""
+    ensure_models(CacheConfig())
+    assert fake_hf.calls, "the fallback must be allowed to reach the network"
+    for call in fake_hf.calls:
+        assert call["local_files_only"] is False, "offline mode leaked into the download call"
+
+
+# =============================================================================
+# Incomplete caches
+# =============================================================================
+
+
+def test_incomplete_cache_is_refetched(volume: Path, fake_hf: SnapshotRecorder) -> None:
+    """Present-but-broken must not boot: re-fetch instead."""
+    populate_runpod_cache(volume, MODEL_REPO, ("config.json",))  # missing the weights
+    populate_runpod_cache(volume, VAE_REPO, REQUIRED_VAE_FILES)
+
+    report = ensure_models(CacheConfig())
+    assert MODEL_REPO in report.downloaded
+
+
+def test_download_that_writes_nothing_names_the_endpoint_config(volume: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A download that leaves the cache empty must say what to check.
+
+    The operationally important failure: the endpoint's cache was configured for
+    a repo the volume does not have, and the fallback also came up empty. The
+    message points at the one place to look.
+    """
+    module = types.ModuleType("huggingface_hub")
+    module.snapshot_download = lambda *a, **k: "ok"  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "huggingface_hub", module)
+
+    with pytest.raises(BootError, match="cached-models configuration"):
+        ensure_models(CacheConfig())
+
+
+def test_incomplete_after_a_real_download_names_the_repo_layout(volume: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A download that lands *some* files but not the required ones.
+
+    An upstream layout change rather than a misconfiguration — a different
+    diagnosis, so a different message.
+    """
+    module = types.ModuleType("huggingface_hub")
+
+    def partial(repo_id: str, **kwargs: Any) -> str:
+        cache_dir = Path(kwargs["cache_dir"])
+        org, name = repo_id.split("/", 1)
+        snap = cache_dir / f"models--{org}--{name}" / "snapshots" / "rev1"
+        snap.mkdir(parents=True, exist_ok=True)
+        (snap / "config.json").write_bytes(b"x")  # present, but no weights
+        refs = snap.parent.parent / "refs"
+        refs.mkdir(parents=True, exist_ok=True)
+        (refs / "main").write_text("rev1", encoding="utf-8")
+        return str(snap)
+
+    module.snapshot_download = partial  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "huggingface_hub", module)
+
     with pytest.raises(BootError, match=r"model-facts\.md"):
         ensure_models(CacheConfig())
 
 
-def test_local_files_only_hint_in_cold_start_error(
-    volume: Path, fake_hf: SnapshotRecorder, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    def boom(*a: Any, **k: Any) -> str:
-        raise OSError("no network")
-
-    # Patch the module attribute, not the instance: Python resolves `__call__`
-    # on the type, so an instance-level setattr here would be silently ignored.
-    monkeypatch.setattr(sys.modules["huggingface_hub"], "snapshot_download", boom)
-    monkeypatch.setenv("HF_LOCAL_FILES_ONLY", "true")
-    with pytest.raises(BootError, match="HF_LOCAL_FILES_ONLY"):
-        ensure_models(CacheConfig())
+# =============================================================================
+# allow_patterns
+# =============================================================================
 
 
-def test_snapshot_download_receives_volume_cache_dir(volume: Path, fake_hf: SnapshotRecorder) -> None:
-    fake_hf.populate = {
-        "m-a-p/YuE2-3B": REQUIRED_MODEL_FILES,
-        "m-a-p/YuE2-Vae": REQUIRED_VAE_FILES,
-    }
+def test_download_excludes_demo_assets(volume: Path, fake_hf: SnapshotRecorder) -> None:
+    """The repo ships demo MP3s and artwork the worker never reads."""
     ensure_models(CacheConfig())
-    # Every download must land under the volume, never the container disk.
-    for call in fake_hf.calls:
-        assert str(volume) in call["local_dir"]
-        assert str(volume) in call["cache_dir"]
-
-
-def test_allow_patterns_exclude_demo_assets(volume: Path, fake_hf: SnapshotRecorder) -> None:
-    """A cold start must not pull the repo's demo audio and artwork.
-
-    `m-a-p/YuE2-3B` ships sample MP3s under `assets/audio/`, a PDF and a logo.
-    Without `allow_patterns`, `snapshot_download` fetches all of it — megabytes
-    of cold-start transfer the worker never reads.
-    """
-    fake_hf.populate = {
-        "m-a-p/YuE2-3B": REQUIRED_MODEL_FILES,
-        "m-a-p/YuE2-Vae": REQUIRED_VAE_FILES,
-    }
-    ensure_models(CacheConfig())
-
     for call in fake_hf.calls:
         patterns = call["allow_patterns"]
-        assert patterns, "every download must be pattern-limited"
+        assert patterns
         assert not any(p.startswith("assets/") for p in patterns)
-        # The weight files themselves must still be included.
         assert "model.safetensors" in patterns
 
 
-def test_model_patterns_still_include_the_wheel(volume: Path, fake_hf: SnapshotRecorder) -> None:
-    """The `yue2_infer` wheel lives in this repo; the image build needs it cached."""
-    fake_hf.populate = {
-        "m-a-p/YuE2-3B": REQUIRED_MODEL_FILES,
-        "m-a-p/YuE2-Vae": REQUIRED_VAE_FILES,
-    }
+def test_model_download_includes_the_wheel(volume: Path, fake_hf: SnapshotRecorder) -> None:
+    """`yue2_infer` ships in this repo rather than on PyPI."""
     ensure_models(CacheConfig())
-    model_call = next(c for c in fake_hf.calls if c["repo_id"] == "m-a-p/YuE2-3B")
+    model_call = next(c for c in fake_hf.calls if c["repo_id"] == MODEL_REPO)
     assert "*.whl" in model_call["allow_patterns"]
 
 
-# --- wheel -------------------------------------------------------------------
+# =============================================================================
+# Wheel lookup
+# =============================================================================
 
 
-def test_install_model_wheel_finds_the_cached_wheel(volume: Path) -> None:
-    wheel = volume / "models" / "YuE2-3B" / MODEL_WHEEL
-    wheel.write_bytes(b"PK")
-    assert install_model_wheel(CacheConfig()) == wheel
+def test_install_model_wheel_finds_it_in_the_cache(volume: Path) -> None:
+    populate_runpod_cache(volume, MODEL_REPO, (*REQUIRED_MODEL_FILES, MODEL_WHEEL))
+    assert install_model_wheel(CacheConfig()) == snapshot_dir(volume, MODEL_REPO) / MODEL_WHEEL
 
 
-def test_install_model_wheel_explains_where_it_comes_from(volume: Path) -> None:
+def test_install_model_wheel_reports_a_missing_repo(volume: Path) -> None:
+    with pytest.raises(BootError, match="not in the cache"):
+        install_model_wheel(CacheConfig())
+
+
+def test_install_model_wheel_reports_a_missing_wheel(volume: Path) -> None:
+    populate_runpod_cache(volume, MODEL_REPO, REQUIRED_MODEL_FILES)  # no wheel
     with pytest.raises(BootError, match="ships inside"):
         install_model_wheel(CacheConfig())
 
 
-# --- health ------------------------------------------------------------------
+# =============================================================================
+# health
+# =============================================================================
 
 
-def test_health_reports_a_populated_volume(volume: Path) -> None:
-    populate_volume(volume)
-    report = health()
-    assert report["volume_mounted"] is True
-    assert report["model_files_missing"] == []
-    assert report["vae_files_missing"] == []
+def test_health_reports_a_populated_cache(volume: Path) -> None:
+    cached_all(volume)
+    h = health()
+    assert h["volume_mounted"] is True
+    assert h["hub_cache_populated"] is True
+    assert h["model_source"] == "cache"
+    assert h["model_files_missing"] == []
+    assert h["vae_files_missing"] == []
 
 
-def test_health_lists_missing_files_on_an_empty_volume(volume: Path) -> None:
-    report = health()
-    assert report["volume_mounted"] is True
-    assert "model.safetensors" in report["model_files_missing"]
+def test_health_reports_an_absent_cache_without_raising(volume: Path) -> None:
+    """A probe must describe a cold volume, not fail on one."""
+    h = health()
+    assert h["model_source"] == "absent"
+    assert h["hub_cache_populated"] is False
+    assert "model.safetensors" in h["model_files_missing"]
+
+
+def test_health_names_the_hub_cache_path(volume: Path) -> None:
+    """A misconfigured endpoint should be diagnosable from this field."""
+    assert health()["hub_cache"] == str(volume / "huggingface-cache" / "hub")
 
 
 def test_health_does_not_require_a_gpu(volume: Path) -> None:
-    """A health probe that allocates VRAM can fail for the wrong reason."""
     assert "cuda_visible_devices" in health()
 
 
-# --- env plumbing ------------------------------------------------------------
+# =============================================================================
+# env plumbing
+# =============================================================================
 
 
-def test_apply_hf_env_points_every_hf_path_at_the_volume(volume: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("HF_HOME", raising=False)
-    CacheConfig().apply_hf_env()
+def test_apply_hf_env_points_at_runpods_cache(volume: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     import os
 
-    assert os.environ["HF_HOME"].startswith(str(volume))
-    assert os.environ["HUGGINGFACE_HUB_CACHE"].startswith(str(volume))
+    for var in ("HF_HOME", "HF_HUB_CACHE", "HF_XET_CACHE"):
+        monkeypatch.delenv(var, raising=False)
+    CacheConfig().apply_hf_env()
+
+    assert os.environ["HF_HOME"] == str(volume / "huggingface-cache")
+    assert os.environ["HF_HUB_CACHE"] == str(volume / "huggingface-cache" / "hub")
     assert os.environ["HF_XET_CACHE"].startswith(str(volume))
 
 
 def test_load_pipeline_reports_missing_wheel_module(volume: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Without the wheel installed, the error must say so rather than NameError."""
-    populate_volume(volume)
+    cached_all(volume)
     monkeypatch.setitem(sys.modules, "yue2", None)
     with pytest.raises(BootError, match="yue2_infer is not installed"):
         boot.load_pipeline(None, cache=CacheConfig())

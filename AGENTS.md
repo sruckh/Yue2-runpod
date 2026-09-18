@@ -38,6 +38,22 @@ shape — so importing it downloads model weights and tries to start a server. U
 step hydrated the volume inside a build layer and baked ~12 GB of weights into
 the image.
 
+### Model weights: RunPod cache first, volume fallback
+
+Weights are **never** in the image (locked decision 4). Two sources, in order:
+
+1. **RunPod's cached-models feature** — declare the repos in the endpoint
+   configuration and the platform fetches them onto the network volume. The
+   worker reads `/runpod-volume/huggingface-cache/hub` in the standard
+   HuggingFace hub layout (`models--{org}--{name}/snapshots/{rev}/` via
+   `refs/main`).
+2. **Network-volume fallback** — `ensure_models()` downloads anything the cache
+   lacks into that same root using `cache_dir=`, then enables offline mode.
+
+`m-a-p/YuE2-3B` and `m-a-p/YuE2-Vae` both need declaring. Note `m-a-p/YuE2-3B`
+also ships the `yue2_infer` wheel, which the image installs at build time from
+HuggingFace directly — the cache does not exist during a build.
+
 ### Layout RunPod expects
 
 | File | Location | Why |

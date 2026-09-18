@@ -114,9 +114,15 @@ def test_env_bool_accepts_common_truthy_spellings(volume: None, monkeypatch: pyt
 # --- cache -------------------------------------------------------------------
 
 
-def test_hf_home_defaults_under_the_volume(volume) -> None:
+def test_cache_paths_follow_runpods_documented_layout(volume) -> None:
+    """`huggingface-cache/hub` on the volume — where the platform mounts models.
+
+    Not a path of our choosing: RunPod's cached-models feature writes here, so a
+    worker reading anywhere else never sees the cache it was configured with.
+    """
     cache = CacheConfig()
-    assert cache.hf_home == volume / "hf"
+    assert cache.hf_home == volume / "huggingface-cache"
+    assert cache.hub_cache == volume / "huggingface-cache" / "hub"
     assert cache.models_dir == volume / "scratch"
 
 

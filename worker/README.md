@@ -95,6 +95,7 @@ generation is real.
 | Job timeout | ≥ 30 min | ~71 s generation for a 3.6-min song, plus slow boots |
 | Container disk | **30 GB** | The image alone is 12.9 GB — see below |
 | Network volume | mounted at `/runpod-volume` | One datacenter — the volume is DC-specific |
+| Cached models | `m-a-p/YuE2-3B`, `m-a-p/YuE2-Vae` | Lets RunPod fetch the weights instead of the worker; the worker falls back to downloading if these are unset |
 
 The image measures **12.9 GB**, dominated by the `nvidia` CUDA pip wheels (4.3 GB)
 that `torch` pulls in, plus `torch` itself (1.8 GB). The original 20 GB container
@@ -130,10 +131,23 @@ variables on this path.
 
 ## Design notes
 
-**Weights are never baked into the image.** Both repos — `m-a-p/YuE2-3B` and
-`m-a-p/YuE2-Vae` — are cached on the network volume on first boot and reused by
-every later worker. `ensure_models()` is idempotent and checks for the required
-files before calling `snapshot_download`, so a warm start touches no network.
+**Weights are never baked into the image.** RunPod's **cached-models** feature is
+the primary source: models declared in the endpoint's configuration are fetched
+by the platform and mounted on the network volume at
+`/runpod-volume/huggingface-cache/hub` in the standard HuggingFace cache layout
+(`models--{org}--{name}/snapshots/{rev}/`, resolved via `refs/main`).
+
+A **network-volume fallback** covers anything that cache does not: if a repo is
+absent, `ensure_models()` downloads it into the *same* cache root with
+`cache_dir=`, so both sources are one tree and the next start is a cache hit.
+Once every repo is verified present, offline mode (`HF_HUB_OFFLINE=1`) is
+enabled — which is what makes a later missing blob fail loudly instead of
+quietly re-downloading 12 GB.
+
+The pattern RunPod documents is followed exactly, including the paths. A worker
+that downloads with `local_dir=` instead invents a layout the platform's cache
+cannot see, so the cache is ignored and every start re-downloads — which is what
+this worker did before the layout was corrected.
 
 **Validation happens before the GPU does.** `schema.py` mirrors the pipeline's
 own `SongRequest` bounds on purpose. The pipeline does validate, but it validates
