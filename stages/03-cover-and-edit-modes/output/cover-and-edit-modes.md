@@ -165,6 +165,45 @@ mark them unverifiable rather than assert them:
   That is a difference in convention, not a defect: our parent reads one file for
   both outcomes, which is simpler and is what the tests pin.
 
+## The unification experiment — first run produced a false negative
+
+Two model stacks in this image look incompatible but are not, by their own
+declarations: torch declares no numpy constraint, transformers declares no torch
+constraint, SheetSage2's `config.json` records a *tested-with* version rather
+than a requirement, and its code contains no numpy calls at all. Only one
+structural risk remained — an internal `transformers` import path.
+
+So `probe_unified_stack.py` was written to answer it empirically, in the image.
+**Its first run answered wrongly, for two reasons that were both bugs in the
+probe**, and its printed verdict was read as an answer before either was spotted:
+
+1. It listed `transformers.models.bart.modeling_bart.BartDecoder` as a *module*
+   and passed it to `importlib.import_module`. `BartDecoder` is a **class**.
+   `import_module` takes a module path, so this raised
+   `ModuleNotFoundError: 'modeling_bart' is not a package` — in every
+   environment, at every version, permanently. It reported a structural
+   incompatibility that did not exist.
+2. The Dockerfile ran it with `--offline`, in an image where nothing is cached
+   yet. It could never fetch SheetSage2's code at all, so the code path under
+   test was never reached.
+
+Both produced the same printed line: *"VERDICT: it does not. The pinned split
+stack is required; do not unify."* That was not evidence.
+
+**The lesson is sharper than the previous ones.** A probe that lies is worse
+than no probe, because it converts "unknown" into "no" — and "no" is an answer
+that stops investigation. The earlier failures this stage found were checks that
+*could not fail*; this was a check that failed for the wrong reason and was
+believed.
+
+Fixed: the internal is probed as module-plus-attribute (the module importing is
+not the same claim as the class surviving), and the probe runs with network
+access, since the build has it and downloads the model wheel a few steps above.
+`tests/test_probe_unified_stack.py` pins both, including that the attribute check
+can fail.
+
+**The unification question is therefore still open.** It has not been tested yet.
+
 ## What this stage does **not** prove
 
 - **Neither venv has ever been built.** They are created in the RunPod image

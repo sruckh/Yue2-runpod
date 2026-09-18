@@ -163,9 +163,16 @@ RUN echo "=== installed environments ===" \
 # build error — and making it fatal before we know the answer would mean a red
 # build that says nothing about whether the *product* is broken.
 #
+# NOT `--offline`. The first version passed it, and that made the probe useless:
+# nothing is cached at this point in the build, so it could never fetch
+# SheetSage2's code and reported "not viable" on every run regardless of the
+# stack. The build has network — it downloads the model wheel a few steps above —
+# so the probe is allowed to use it. Only the SheetSage2 `.py` files come down
+# (a few hundred KB), never the weights.
+#
 # Read the result in the Builds tab: `VERDICT: ...` near the end of this step.
 COPY worker/transcribe_sheetsage/probe_unified_stack.py /tmp/probe_unified_stack.py
-RUN python /tmp/probe_unified_stack.py --offline || echo "probe: unified stack NOT viable (see VERDICT above)"
+RUN python /tmp/probe_unified_stack.py || echo "probe: unified stack NOT viable (see VERDICT above)"
 
 # Handler code last — it changes most often, so it invalidates the least.
 COPY worker/ /app/

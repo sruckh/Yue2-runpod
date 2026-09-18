@@ -49,16 +49,24 @@ import traceback
 from importlib import metadata
 from pathlib import Path
 
-#: The classes SheetSage2's own `config.json` auto_map names as its entry points.
-#: Constructing a config exercises `configuration_sheetsage2.py`; importing the
-#: model class exercises its `transformers` imports without needing weights.
+#: `(module, attribute, label)`. `attribute` is None when the module itself is
+#: the thing being checked.
+#:
+#: **A module path is not a class path.** The first version of this listed
+#: `transformers.models.bart.modeling_bart.BartDecoder` and handed it to
+#: `importlib.import_module`, which takes a *module* — so it raised
+#: `ModuleNotFoundError: ... 'modeling_bart' is not a package` in every
+#: environment, at every version. It reported a structural incompatibility that
+#: did not exist, and that false negative was the probe's whole verdict.
+#: `BartDecoder` is an attribute of that module; the module is what SheetSage2
+#: imports it from.
 PROBES = (
-    ("numpy", "numpy"),
-    ("torch", "torch"),
-    ("transformers", "transformers"),
-    ("transformers.models.bart.modeling_bart.BartDecoder", "BartDecoder internals"),
-    ("huggingface_hub", "huggingface_hub"),
-    ("safetensors", "safetensors"),
+    ("numpy", None, "numpy"),
+    ("torch", None, "torch"),
+    ("transformers", None, "transformers"),
+    ("transformers.models.bart.modeling_bart", "BartDecoder", "transformers internal: BartDecoder"),
+    ("huggingface_hub", None, "huggingface_hub"),
+    ("safetensors", None, "safetensors"),
 )
 
 
@@ -73,13 +81,22 @@ def versions() -> dict[str, str]:
 
 
 def probe_imports() -> list[tuple[str, bool, str]]:
-    """Import each of SheetSage2's dependencies in turn."""
+    """Import each of SheetSage2's dependencies, and any named attribute.
+
+    Checking the attribute matters: `import transformers.models.bart.modeling_bart`
+    succeeding only says the module exists, not that `BartDecoder` is still
+    defined in it. SheetSage2 imports the class, so the class is what has to
+    survive a transformers upgrade.
+    """
     import importlib
 
     results = []
-    for module, label in PROBES:
+    for module, attribute, label in PROBES:
         try:
-            importlib.import_module(module)
+            imported = importlib.import_module(module)
+            if attribute is not None and not hasattr(imported, attribute):
+                results.append((label, False, f"module {module} has no attribute {attribute!r}"))
+                continue
             results.append((label, True, ""))
         except BaseException as exc:
             results.append((label, False, f"{type(exc).__name__}: {exc}"))
