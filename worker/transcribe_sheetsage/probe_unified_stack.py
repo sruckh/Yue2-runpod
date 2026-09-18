@@ -13,14 +13,23 @@ The packages do not appear to require each other's versions:
 - transformers 4.45.2 declares **no torch constraint** (torch is an optional extra)
 - SheetSage2's `config.json` records `"transformers_version": "4.45.2"` — a note
   about what it was tested with, not a requirement
-- **Correction (2026-09-18):** an earlier version of this docstring claimed
-  SheetSage2 "contains no numpy calls at all, so the numpy-2 alias removals
-  cannot affect it". That is **false**. `midi_sheetsage2.py` calls
-  `np.flatnonzero`, and numpy usage across the repo's ~25 modules has not been
-  audited. The claim was load-bearing reasoning for calling unification
-  low-risk, and it was never checked. Treat the numpy question as open.
-- torch's own numpy constraint is likewise recorded elsewhere and not re-verified
-  here.
+- **Correction and resolution (2026-09-18).** An earlier version of this
+  docstring claimed SheetSage2 "contains no numpy calls at all, so the numpy-2
+  alias removals cannot affect it". That was **false** — `midi_sheetsage2.py`
+  calls `np.flatnonzero` — and it was written as evidence for calling
+  unification low-risk without ever being checked. It is kept here as a
+  cautionary note rather than deleted.
+
+  The question it was trying to answer is now **settled by audit**: all 22
+  source files use 23 distinct `np.*` names (`ndarray`, `zeros`, `asarray`,
+  `int32`, `float64`, `float32`, `searchsorted`, `diff`, `clip`, `median`,
+  `full`, `any`, `stack`, `maximum`, `linspace`, `isfinite`, `interp`,
+  `frombuffer`, `flatnonzero`, `concatenate`, `array`, `argmin`, `abs`), and
+  **not one is an alias or function removed in numpy 2.0** — no `np.float_`,
+  `np.NaN`, `np.bool8`, `np.alltrue`, `np.in1d`, `np.round_`. The numpy-2
+  migration risk for this repo is very small, and that is now evidence rather
+  than assertion.
+- torch's own numpy constraint is recorded elsewhere and not re-verified here.
 
 The genuine structural risk is that SheetSage2 imports
 `transformers.models.bart.modeling_bart.BartDecoder` — an internal path that can
