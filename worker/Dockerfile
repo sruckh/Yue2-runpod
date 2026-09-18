@@ -56,9 +56,22 @@ RUN pip install --no-cache-dir --upgrade "huggingface-hub==0.36.2" \
 COPY worker/ /app/
 
 # Fails the build rather than the first job if the flat-module layout or an
-# import is broken. Mirrors the `import` smoke test in the CI workflow.
+# import is broken.
+#
+# Importing `handler` must stay side-effect free. It did not once: the boot ran
+# at module import, so this very line hydrated the volume inside the build layer
+# and baked ~12 GB of weights into the image — violating the rule this file's
+# header states. `main()` owns the boot now, so importing is safe.
 RUN python -c "import config, schema, storage, boot, handler" \
     && python -c "import yue2; print('yue2_infer', getattr(yue2, '__version__', 'unknown'))"
+
+# Build-time guard for the rule above: no model weights may exist anywhere in the
+# image. A future refactor that reintroduces an import-time boot, or a COPY that
+# pulls a checkpoint in, fails the build here instead of shipping a container
+# whose image is tens of gigabytes larger than it should be.
+RUN test -z "$(find / -xdev \( -name '*.safetensors' -o -name 'pytorch_model*.bin' \) -not -path '/proc/*' 2>/dev/null)" \
+    || { echo 'ERROR: model weights found in the image — weights belong on the network volume, never in the image'; \
+         find / -xdev -name '*.safetensors' -not -path '/proc/*' 2>/dev/null; exit 1; }
 
 # `-u` keeps stdout/stderr unbuffered so RunPod's log stream shows progress
 # during a 70-second generation rather than in one burst at the end.

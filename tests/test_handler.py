@@ -36,20 +36,16 @@ def valid_input(**overrides: Any) -> dict[str, Any]:
 def handler_module(volume: Path, fake_pipeline: Any, monkeypatch: pytest.MonkeyPatch) -> Any:
     """Import `handler` with the pipeline stubbed out.
 
-    Order matters and is the point: `boot.load_pipeline` is patched *before*
-    `handler` is imported, because `handler` boots at module import. Patching
-    afterwards would be too late — the real loader would already have run and
-    the module would be sitting in its failed-boot state.
-
-    `import boot` returns the already-imported module object, and `handler` does
-    the same, so the patch is visible to `boot_worker()` with no cooperation
-    from the production code.
+    Importing `handler` is side-effect free by design — the boot lives in
+    `main()`, not at module scope, so a test can import it with no GPU and no
+    weights. `boot_worker()` is then called explicitly against the stub.
     """
     import boot
 
     monkeypatch.setattr(boot, "load_pipeline", lambda *a, **k: fake_pipeline)
     module = importlib.import_module("handler")
-    importlib.reload(module)  # re-runs the module-level boot, now against the stub
+    importlib.reload(module)
+    module.boot_worker()  # the worker-start path `main()` performs
     yield module
     module._pipeline = None
     module._boot_error = None

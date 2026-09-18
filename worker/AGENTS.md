@@ -53,16 +53,31 @@ worker that keeps costing money. If you add a new failure mode, add it to the
 handler's catch tuple **and** to the tests; a missing `BootError` there was a
 real bug.
 
-### The pipeline boots at import, and that is load-bearing
+### The pipeline boots in `main()`, once per worker start
 
-`boot_worker()` runs as the last statement of `handler.py`. Do not make it lazy.
-A lazy first load puts a ~12 GB download plus model construction inside a *job's*
-timeout budget, so the first job on a cold volume gets killed for taking longer
-than a generation is allowed to take. A failed boot is recorded in `_boot_error`
-and reported per job — one cold start, never one per job.
+`boot_worker()` is called by `main()` before `runpod.serverless.start`. **Do not
+move it to module import, and do not make it lazy.**
 
-Tests import this module with `boot.load_pipeline` already patched. Patch before
-importing, or the real loader runs.
+Both alternatives are wrong, and both were tried here:
+
+- **Lazy** (on first job) puts a ~12 GB download plus model construction inside a
+  *job's* timeout budget, so the first job on a cold volume gets killed for
+  taking longer than a generation is allowed to take.
+- **At import** breaks the image. The Dockerfile's `import handler` smoke test
+  executed the boot, hydrating the volume *inside a build layer* and baking
+  ~12 GB of weights into the image — the thing locked decision 4 forbids. That
+  shipped once and the image had to be deleted. `Dockerfile` now has a
+  build-time guard that fails if any `*.safetensors` exists in the image.
+
+The requirement was never "at import"; it was **before the first job**. `main()`
+satisfies it, and importing the module stays free of side effects — which is what
+makes the build guard and any tooling import possible.
+
+A failed boot is recorded in `_boot_error` and reported per job: one cold start,
+never one per job.
+
+Tests must call `module.boot_worker()` explicitly after importing; import alone
+leaves the module unbooted.
 
 ### What the pipeline reports is not always what it looks like
 

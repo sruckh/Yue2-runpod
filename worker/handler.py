@@ -450,8 +450,25 @@ def _job_timeout_seconds() -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Standalone entry: either serve via RunPod, or run one test input."""
+    """Container entrypoint: boot once, then either serve or run a test input.
+
+    **This is where the boot lives — not at module import.** Importing a module
+    should not download 12 GB of model weights, and a boot at import broke the
+    image build: the Dockerfile's `import handler` smoke test executed
+    `boot_worker()`, which hydrated the volume *inside the build layer* and baked
+    the weights into the image — the exact thing locked decision 4 forbids. That
+    happened; the image had to be deleted.
+
+    The worker contract is still satisfied: this runs once per worker start,
+    before `runpod.serverless.start` accepts any job. So the pipeline is resident
+    before the first job, and the first job's timeout budget never has to cover a
+    weight download. Import-time was never the requirement — *before the first
+    job* was.
+    """
     argv = sys.argv[1:] if argv is None else argv
+
+    boot_worker()
+
     try:
         import runpod
     except ImportError:
@@ -508,17 +525,6 @@ class _LocalStorage:
             for path in sorted(p for p in Path(directory).rglob("*") if p.is_file())
         }
 
-
-# --- module-import boot -------------------------------------------------------
-# The contract calls for the pipeline to be resident before the first job, so
-# this runs here rather than on first use. It is the last statement in the
-# module so every definition it needs already exists.
-#
-# Tests patch `boot.load_pipeline` before importing this module rather than
-# gating this call behind an env var: a test-only escape hatch in production
-# code is a backdoor, and `import boot` yields the same module object, so the
-# patch reaches `boot_worker` with no production-side concession.
-boot_worker()
 
 if __name__ == "__main__":
     sys.exit(main())

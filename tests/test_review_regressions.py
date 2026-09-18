@@ -18,6 +18,7 @@ from __future__ import annotations
 import importlib
 import json
 import sys
+import types
 from pathlib import Path
 from typing import Any
 
@@ -38,11 +39,19 @@ def valid_input(**overrides: Any) -> dict[str, Any]:
 
 @pytest.fixture
 def handler_module(volume: Path, fake_pipeline: Any, monkeypatch: pytest.MonkeyPatch) -> Any:
+    """A `handler` module in the same state `main()` leaves it: booted.
+
+    `import` is inert by design, so the boot must be performed explicitly here.
+    Both this and `test_handler.py`'s fixture do that; if a third suite appears,
+    it should share this helper rather than re-deriving it — the two fixtures
+    drifting apart is how six tests broke at once when boot moved into `main()`.
+    """
     import boot
 
     monkeypatch.setattr(boot, "load_pipeline", lambda *a, **k: fake_pipeline)
     module = importlib.import_module("handler")
     importlib.reload(module)
+    module.boot_worker()
     yield module
     module._pipeline = None
     module._boot_error = None
@@ -174,31 +183,66 @@ def test_decoder_is_not_taken_from_the_bare_environment(
 # =============================================================================
 
 
-def test_boot_runs_at_import_not_on_first_job(volume: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """The pipeline must be resident *before* the first job.
+def test_importing_handler_does_not_boot(volume: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Importing the module must have no side effects.
 
-    A lazy first load puts a ~12 GB download plus model construction inside a
-    job's own timeout budget — so the first job on a cold volume would be killed
-    for taking longer than a generation is allowed to take. The docstring
-    claimed import-time boot while the code did it lazily; this pins the claim.
+    This is the guard for a mistake that actually shipped: with the boot at
+    module scope, the Dockerfile's `import handler` smoke test hydrated the
+    network volume *inside a build layer* and baked ~12 GB of weights into the
+    image — the exact thing locked decision 4 forbids. The image had to be
+    deleted.
+
+    A module import that downloads model weights is wrong on its own terms, and
+    it breaks any tool that imports the code to inspect it.
     """
     import boot
 
     boots: list[int] = []
 
-    class FakePipe:
-        def close(self) -> None: ...
-
     def fake_load(*a: Any, **k: Any) -> Any:
         boots.append(1)
-        return FakePipe()
+        return object()
 
     monkeypatch.setattr(boot, "load_pipeline", fake_load)
     module = importlib.import_module("handler")
     importlib.reload(module)
 
-    assert len(boots) == 1, "boot must happen at import"
-    assert module._pipeline is not None, "the pipeline must be resident before any job runs"
+    assert boots == [], "importing handler must not load the pipeline"
+    assert module._pipeline is None
+
+
+def test_boot_happens_before_the_first_job(volume: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The pipeline must be resident before `runpod.serverless.start` is called.
+
+    A lazy first load would put a ~12 GB download plus model construction inside
+    a job's own timeout budget, so the first job on a cold volume would be killed
+    for taking longer than a generation is allowed to take. `main()` boots before
+    handing control to RunPod, which is what satisfies that.
+    """
+    import boot
+
+    calls: list[str] = []
+
+    def fake_load(*a: Any, **k: Any) -> Any:
+        calls.append("load_pipeline")
+        return object()
+
+    class FakeServerless:
+        @staticmethod
+        def start(_config: Any) -> None:
+            calls.append("serverless.start")
+
+    monkeypatch.setattr(boot, "load_pipeline", fake_load)
+    module = importlib.import_module("handler")
+    importlib.reload(module)
+
+    fake_runpod = types.ModuleType("runpod")
+    fake_runpod.serverless = FakeServerless()  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "runpod", fake_runpod)
+
+    module.main([])
+
+    assert calls == ["load_pipeline", "serverless.start"], f"boot must precede serving, got {calls}"
     module._pipeline = None
 
 
