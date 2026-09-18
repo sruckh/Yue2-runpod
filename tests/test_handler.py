@@ -15,6 +15,7 @@ from __future__ import annotations
 import importlib
 import json
 import sys
+import types
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +25,20 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 WORKER_DIR = REPO_ROOT / "worker"
 if str(WORKER_DIR) not in sys.path:
     sys.path.insert(0, str(WORKER_DIR))
+
+
+def _fake_runpod() -> Any:
+    """A stand-in for the `runpod` SDK.
+
+    `handler` calls `runpod.serverless.start(...)` at module scope, so importing
+    it without the SDK either raises or (worse, with the real SDK) starts a
+    server. This keeps the import inert.
+    """
+    import types as _types
+
+    module = _types.ModuleType("runpod")
+    module.serverless = _types.SimpleNamespace(start=lambda *a, **k: None)
+    return module
 
 
 def valid_input(**overrides: Any) -> dict[str, Any]:
@@ -36,16 +51,19 @@ def valid_input(**overrides: Any) -> dict[str, Any]:
 def handler_module(volume: Path, fake_pipeline: Any, monkeypatch: pytest.MonkeyPatch) -> Any:
     """Import `handler` with the pipeline stubbed out.
 
-    Importing `handler` is side-effect free by design — the boot lives in
-    `main()`, not at module scope, so a test can import it with no GPU and no
-    weights. `boot_worker()` is then called explicitly against the stub.
+    `handler` boots the pipeline at module scope — the standard RunPod shape, and
+    it ends by calling `runpod.serverless.start`. So the loader AND the SDK are
+    both stubbed *before* the import: patching afterwards would be too late, the
+    real loader would already have run, and the import would try to start a
+    server.
     """
     import boot
 
     monkeypatch.setattr(boot, "load_pipeline", lambda *a, **k: fake_pipeline)
+    monkeypatch.setattr(_fake_runpod(), "serverless", types.SimpleNamespace(start=lambda *a, **k: None))
+    monkeypatch.setitem(sys.modules, "runpod", _fake_runpod())
     module = importlib.import_module("handler")
     importlib.reload(module)
-    module.boot_worker()  # the worker-start path `main()` performs
     yield module
     module._pipeline = None
     module._boot_error = None

@@ -53,31 +53,31 @@ worker that keeps costing money. If you add a new failure mode, add it to the
 handler's catch tuple **and** to the tests; a missing `BootError` there was a
 real bug.
 
-### The pipeline boots in `main()`, once per worker start
+### The pipeline boots at module scope, then hands off to RunPod
 
-`boot_worker()` is called by `main()` before `runpod.serverless.start`. **Do not
-move it to module import, and do not make it lazy.**
+`handler.py` ends with:
 
-Both alternatives are wrong, and both were tried here:
+```python
+boot_worker()
+runpod.serverless.start({"handler": handler})
+```
 
-- **Lazy** (on first job) puts a ~12 GB download plus model construction inside a
-  *job's* timeout budget, so the first job on a cold volume gets killed for
-  taking longer than a generation is allowed to take.
-- **At import** breaks the image. The Dockerfile's `import handler` smoke test
-  executed the boot, hydrating the volume *inside a build layer* and baking
-  ~12 GB of weights into the image — the thing locked decision 4 forbids. That
-  shipped once and the image had to be deleted. `Dockerfile` now has a
-  build-time guard that fails if any `*.safetensors` exists in the image.
+This is the **standard RunPod worker shape** — the reference workers do the same,
+and the SDK is what discovers `--test_input` and drives the handler. Do not wrap
+it in a custom `main()`: an earlier version did, and it worked, but it hid the
+`runpod.serverless.start` call inside a function where neither a reader nor a
+build script looks for it.
 
-The requirement was never "at import"; it was **before the first job**. `main()`
-satisfies it, and importing the module stays free of side effects — which is what
-makes the build guard and any tooling import possible.
+Boot must come **before** `start()`. Lazy-loading on the first job would put a
+~12 GB download plus model construction inside a *job's* timeout budget, so the
+first job on a cold volume would be killed for taking longer than a generation is
+allowed to take. A failed boot is recorded in `_boot_error` and reported per job:
+one cold start, never one per job.
 
-A failed boot is recorded in `_boot_error` and reported per job: one cold start,
-never one per job.
-
-Tests must call `module.boot_worker()` explicitly after importing; import alone
-leaves the module unbooted.
+**Consequence: importing `handler` has side effects** — it boots, and it starts a
+server. Anything that inspects this code (the Dockerfile, CI, tests) must use
+`python -m py_compile` rather than `import`. Tests stub `boot.load_pipeline` and
+`runpod.serverless` *before* importing.
 
 ### What the pipeline reports is not always what it looks like
 
@@ -118,7 +118,7 @@ module that talks to object storage; `handler.py` never imports boto3 directly.
 ### Secrets come from the environment
 
 B2 credentials are set on the RunPod endpoint template. A key baked into the
-`Dockerfile` persists in the image layers forever — never do it, not even
+the root `Dockerfile` persists in the image layers forever — never do it, not even
 temporarily, not even for a test.
 
 ## Verification

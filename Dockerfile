@@ -55,15 +55,17 @@ RUN pip install --no-cache-dir --upgrade "huggingface-hub==0.36.2" \
 # Handler code last — it changes most often, so it invalidates the least.
 COPY worker/ /app/
 
-# Fails the build rather than the first job if the flat-module layout or an
-# import is broken.
+# Syntax-check every module WITHOUT executing it.
 #
-# Importing `handler` must stay side-effect free. It did not once: the boot ran
-# at module import, so this very line hydrated the volume inside the build layer
-# and baked ~12 GB of weights into the image — violating the rule this file's
-# header states. `main()` owns the boot now, so importing is safe.
-RUN python -c "import config, schema, storage, boot, handler" \
-    && python -c "import yue2; print('yue2_infer', getattr(yue2, '__version__', 'unknown'))"
+# This must not `import handler`. `handler` boots the pipeline at module scope
+# (the standard RunPod shape) and instantiates `runpod.serverless.start`, so
+# importing it here would hydrate the network volume inside a build layer and
+# bake ~12 GB of model weights into the image. That happened during development;
+# `py_compile` catches a syntax error just as well and runs nothing.
+RUN python -m py_compile /app/*.py && echo "all modules compile"
+
+# Confirm the wheel actually landed and imports (it has no boot side effects).
+RUN python -c "import yue2; print('yue2_infer', getattr(yue2, '__version__', 'unknown'))"
 
 # Build-time guard for the rule above: no model weights may exist anywhere in the
 # image. A future refactor that reintroduces an import-time boot, or a COPY that

@@ -39,19 +39,20 @@ def valid_input(**overrides: Any) -> dict[str, Any]:
 
 @pytest.fixture
 def handler_module(volume: Path, fake_pipeline: Any, monkeypatch: pytest.MonkeyPatch) -> Any:
-    """A `handler` module in the same state `main()` leaves it: booted.
+    """A booted `handler` module, without a GPU or the runpod SDK.
 
-    `import` is inert by design, so the boot must be performed explicitly here.
-    Both this and `test_handler.py`'s fixture do that; if a third suite appears,
-    it should share this helper rather than re-deriving it — the two fixtures
-    drifting apart is how six tests broke at once when boot moved into `main()`.
+    `handler` boots at module scope and ends by calling
+    `runpod.serverless.start`, so both the loader and the SDK are stubbed before
+    the import.
     """
     import boot
 
     monkeypatch.setattr(boot, "load_pipeline", lambda *a, **k: fake_pipeline)
+    fake = types.ModuleType("runpod")
+    fake.serverless = types.SimpleNamespace(start=lambda *a, **k: None)  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "runpod", fake)
     module = importlib.import_module("handler")
     importlib.reload(module)
-    module.boot_worker()
     yield module
     module._pipeline = None
     module._boot_error = None
@@ -183,66 +184,61 @@ def test_decoder_is_not_taken_from_the_bare_environment(
 # =============================================================================
 
 
-def test_importing_handler_does_not_boot(volume: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Importing the module must have no side effects.
+def test_import_boots_then_hands_the_handler_to_runpod(volume: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The standard RunPod startup shape, in order.
 
-    This is the guard for a mistake that actually shipped: with the boot at
-    module scope, the Dockerfile's `import handler` smoke test hydrated the
-    network volume *inside a build layer* and baked ~12 GB of weights into the
-    image — the exact thing locked decision 4 forbids. The image had to be
-    deleted.
+    This is the contract the platform expects and the one the reference workers
+    use: configure at module scope, then `runpod.serverless.start({"handler": ...})`.
+    Boot must come **first** — a lazy first load would put a ~12 GB download plus
+    model construction inside a job's own timeout budget, so the first job on a
+    cold volume would be killed for taking longer than a generation is allowed.
 
-    A module import that downloads model weights is wrong on its own terms, and
-    it breaks any tool that imports the code to inspect it.
-    """
-    import boot
-
-    boots: list[int] = []
-
-    def fake_load(*a: Any, **k: Any) -> Any:
-        boots.append(1)
-        return object()
-
-    monkeypatch.setattr(boot, "load_pipeline", fake_load)
-    module = importlib.import_module("handler")
-    importlib.reload(module)
-
-    assert boots == [], "importing handler must not load the pipeline"
-    assert module._pipeline is None
-
-
-def test_boot_happens_before_the_first_job(volume: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """The pipeline must be resident before `runpod.serverless.start` is called.
-
-    A lazy first load would put a ~12 GB download plus model construction inside
-    a job's own timeout budget, so the first job on a cold volume would be killed
-    for taking longer than a generation is allowed to take. `main()` boots before
-    handing control to RunPod, which is what satisfies that.
+    This test also pins the *shape*, because an earlier version wrapped startup in
+    a custom `main()`. That worked, but it hid `runpod.serverless.start` inside a
+    function where nobody looks for it — and RunPod's SDK is what discovers
+    `--test_input`, so the wrapper was redundant as well as obscure.
     """
     import boot
 
     calls: list[str] = []
+    started_with: list[Any] = []
 
     def fake_load(*a: Any, **k: Any) -> Any:
-        calls.append("load_pipeline")
+        calls.append("boot")
         return object()
 
-    class FakeServerless:
-        @staticmethod
-        def start(_config: Any) -> None:
-            calls.append("serverless.start")
+    def fake_start(config: Any) -> None:
+        calls.append("start")
+        started_with.append(config)
 
     monkeypatch.setattr(boot, "load_pipeline", fake_load)
+    fake_runpod = types.ModuleType("runpod")
+    fake_runpod.serverless = types.SimpleNamespace(start=fake_start)  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "runpod", fake_runpod)
+
     module = importlib.import_module("handler")
     importlib.reload(module)
 
-    fake_runpod = types.ModuleType("runpod")
-    fake_runpod.serverless = FakeServerless()  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "runpod", fake_runpod)
+    assert calls == ["boot", "start"], f"expected boot then start, got {calls}"
+    assert started_with and "handler" in started_with[0], "start() must be given the handler"
+    assert started_with[0]["handler"] is module.handler
+    module._pipeline = None
 
-    module.main([])
 
-    assert calls == ["load_pipeline", "serverless.start"], f"boot must precede serving, got {calls}"
+def test_handler_is_a_module_level_callable(volume: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`handler` must be importable by name — that is what `start()` receives."""
+    import boot
+
+    monkeypatch.setattr(boot, "load_pipeline", lambda *a, **k: object())
+    fake = types.ModuleType("runpod")
+    fake.serverless = types.SimpleNamespace(start=lambda *a, **k: None)  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "runpod", fake)
+
+    module = importlib.import_module("handler")
+    importlib.reload(module)
+
+    assert callable(module.handler)
+    assert module.handler.__name__ == "handler"
     module._pipeline = None
 
 

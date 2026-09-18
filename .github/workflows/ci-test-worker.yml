@@ -53,19 +53,22 @@ jobs:
       - name: Run tests
         run: python -m pytest tests/ -q
 
-      - name: Smoke-test the handler entrypoint
-        # Proves the module imports and the flat-import layout resolves, which is
-        # the failure the Dockerfile's own import check also guards.
+      - name: Check the flat-import layout resolves
+        # A syntax + layout check that does NOT import `handler`.
+        #
+        # Importing it boots the pipeline and calls `runpod.serverless.start` at
+        # module scope (the standard RunPod shape), so a real import here would
+        # try to download weights into the CI runner and start a server. The
+        # Dockerfile makes the same distinction.
         run: |
           cd worker
-          python -c "import config, schema, storage, boot, handler; print('imports OK')"
+          python -m py_compile *.py && echo "modules compile"
+          python -c "import config, schema, storage, boot; print('imports OK')"
 
-  docker-build:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Build the image
-        # No push, no secrets. Catches Dockerfile breakage (a moved file, a
-        # broken wheel URL) without needing registry credentials.
-        run: docker build -f worker/Dockerfile -t yue2-worker:ci .
+  # No docker-build job, deliberately.
+  #
+  # The image is built by **RunPod's platform** from this repository, per locked
+  # decision 1 ("nothing installed or executed on any dev/ops box we control").
+  # Rebuilding it here would duplicate that work on a runner, and a green CI
+  # build proves nothing about the environment that actually serves traffic.
+  # RunPod's endpoint "Builds" tab is the real signal.

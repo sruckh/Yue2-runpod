@@ -52,8 +52,10 @@ worker/
 ├── storage.py       Backblaze B2 egress over the S3 API
 ├── config.py        Environment-driven settings
 ├── requirements.txt Exact pins — never a loose range (see below)
-├── Dockerfile       python:3.12-slim + libsndfile1; wheel from the HF repo
 └── .runpod/         Endpoint config and example job payloads
+
+Dockerfile            At the REPO ROOT (RunPod's GitHub build looks there by
+                      default). python:3.12-slim + libsndfile1 + ffmpeg.
 tests/               173 tests, GPU and B2 both mocked
 ```
 
@@ -143,15 +145,16 @@ boot, generation, upload, response assembly — returns `{"error": "..."}` rathe
 than raising. A worker that dies on one bad job is a worker that keeps costing
 money.
 
-**The pipeline is resident before the first job.** Boot runs once at worker start,
-in `main()` before `serverless.start` — not lazily on first use, which would put a
-~12 GB download and model construction inside a job's own timeout budget. If boot
-fails, the failure is remembered and every job answers from it immediately: one
-cold start, not one per job.
+**The pipeline is resident before the first job.** `handler.py` ends with
+`boot_worker()` followed by `runpod.serverless.start({"handler": handler})` — the
+standard RunPod shape. Boot runs once at worker start, not lazily on first use,
+which would put a ~12 GB download and model construction inside a job's own
+timeout budget. If boot fails, the failure is remembered and every job answers
+from it immediately: one cold start, not one per job.
 
-Importing `handler` is deliberately side-effect free. An import-time boot once
-made the image build download the weights into a layer; the Dockerfile now fails
-the build if any `*.safetensors` ends up in the image.
+Importing `handler` therefore has side effects. Anything that inspects the code
+without running it — the Dockerfile, CI — uses `python -m py_compile`, and the
+Dockerfile fails the build if any `*.safetensors` ends up in the image.
 
 **`truncated` is derived, not coerced.** The pipeline's `SongResult.truncated` is
 a dict (`{"abc": bool, "semantic": bool}`), and `bool()` of a non-empty dict is

@@ -157,6 +157,20 @@ Stated plainly, because the contract's Human check exists for exactly this:
 Needs: an RTX 4090-class GPU, a RunPod API key, B2 credentials, and a network
 volume. None exist on the machine this was built on.
 
+## Layout corrections and a process failure
+
+Two placement mistakes and one rule violation are documented in full in
+`review-findings.md`. In short, because the next stage depends on the outcomes:
+
+- **`Dockerfile` is at the repository root**, not `worker/` — RunPod's GitHub
+  build looks there by default.
+- **`runpod.serverless.start` is at module scope** in `handler.py`, preceded by
+  `boot_worker()`. Importing that module therefore downloads weights and starts a
+  server; use `python -m py_compile` to check it, never `import`.
+- **Nothing is built locally.** Locked decision 1 forbids it, and it was violated
+  five times during this stage. The rule now lives in the root `AGENTS.md` under
+  **Build & deploy**.
+
 ## Open question carried forward
 
 `shared/dependency-pins.md` flags that Qwen3-ASR could plausibly share YuE2's

@@ -31,7 +31,6 @@ import logging
 import os
 import shutil
 import signal
-import sys
 import time
 import uuid
 from collections.abc import Iterator
@@ -44,6 +43,8 @@ from config import CacheConfig, ConfigError, WorkerConfig
 
 _CONFIG_CACHE = CacheConfig()
 _CONFIG_CACHE.apply_hf_env()
+
+import runpod  # noqa: E402 - must follow apply_hf_env()
 
 import boot  # noqa: E402 - must follow apply_hf_env()
 from schema import MissingInputError, SongParameters, ValidationError, validate_job, validate_mode  # noqa: E402
@@ -449,82 +450,22 @@ def _job_timeout_seconds() -> int:
     return configured
 
 
-def main(argv: list[str] | None = None) -> int:
-    """Container entrypoint: boot once, then either serve or run a test input.
+# --- worker startup -----------------------------------------------------------
+# The canonical RunPod pattern, matching the reference workers: configure the
+# runtime at module scope, then hand the handler to the SDK.
+#
+# `boot_worker()` runs here, before `serverless.start`, so the pipeline is
+# resident before the first job and no job's timeout budget ever has to cover a
+# ~12 GB weight download.
+#
+# It is deliberately NOT inside `main()` or behind a flag: RunPod's SDK discovers
+# `--test_input` itself and drives the same handler, so the reference shape is
+# both the simplest and the one the platform expects. An earlier version of this
+# file wrapped startup in a custom `main()`, which worked but hid the
+# `runpod.serverless.start` call where nobody looks for it.
+#
+# Importing this module therefore has a side effect: with no patched loader it
+# will attempt a boot. Tests patch `boot.load_pipeline` before importing.
+boot_worker()
 
-    **This is where the boot lives — not at module import.** Importing a module
-    should not download 12 GB of model weights, and a boot at import broke the
-    image build: the Dockerfile's `import handler` smoke test executed
-    `boot_worker()`, which hydrated the volume *inside the build layer* and baked
-    the weights into the image — the exact thing locked decision 4 forbids. That
-    happened; the image had to be deleted.
-
-    The worker contract is still satisfied: this runs once per worker start,
-    before `runpod.serverless.start` accepts any job. So the pipeline is resident
-    before the first job, and the first job's timeout budget never has to cover a
-    weight download. Import-time was never the requirement — *before the first
-    job* was.
-    """
-    argv = sys.argv[1:] if argv is None else argv
-
-    boot_worker()
-
-    try:
-        import runpod
-    except ImportError:
-        runpod = None  # type: ignore[assignment]
-
-    if runpod is None:
-        # Local dry run without the SDK installed — still useful in CI.
-        log.warning("runpod SDK not installed; running in test-input mode only")
-        return _run_test_input(argv, storage=None)
-
-    test_input = next((a.split("=", 1)[1] for a in argv if a.startswith("--test_input=")), None)
-    if test_input:
-        return _run_test_input(argv, storage=None)
-
-    log.info("starting RunPod serverless worker")
-    runpod.serverless.start({"handler": handler})
-    return 0
-
-
-def _run_test_input(argv: list[str], storage: Any | None) -> int:
-    """Execute a single job from `--test_input` and print its result.
-
-    Storage is replaced with a local stand-in so the path is exercisable with no
-    B2 credentials and no GPU-side upload — this is the hook the CI workflow in
-    `.github/workflows/` drives.
-    """
-    raw = next((a.split("=", 1)[1] for a in argv if a.startswith("--test_input=")), None)
-    if raw is None:
-        print("usage: handler.py --test_input='{\"input\": {...}}'", file=sys.stderr)
-        return 2
-    job = json.loads(raw)
-    result = run_create_job(job, storage=storage or _LocalStorage())
-    print(json.dumps(result, indent=2))
-    return 0 if "error" not in result else 1
-
-
-class _LocalStorage:
-    """Drop-in stand-in for `B2Storage` that keeps artifacts on local disk.
-
-    Used only by `--test_input` runs. It returns `file://` URLs so the printed
-    result has the same shape as production without pretending to be reachable.
-    """
-
-    def upload_directory(self, directory: Path, prefix: str) -> dict[str, Any]:
-        from storage import UploadedArtifact
-
-        return {
-            path.relative_to(directory).as_posix(): UploadedArtifact(
-                key=f"{prefix}/{path.relative_to(directory).as_posix()}",
-                url=f"file://{path}",
-                size_bytes=path.stat().st_size,
-                content_type="application/octet-stream",
-            )
-            for path in sorted(p for p in Path(directory).rglob("*") if p.is_file())
-        }
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+runpod.serverless.start({"handler": handler})
