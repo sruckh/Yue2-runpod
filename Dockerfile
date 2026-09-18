@@ -26,16 +26,33 @@
 #
 # **That reasoning was correct for YuE2 and was wrongly generalised to the
 # whole image.** It says nothing about the other two environments, and
-# `qwen-asr` pulls `triton` into its dependency tree. Triton JIT-compiles CUDA
-# kernels at runtime and needs a host C compiler to do it, so `cover` failed on
-# real hardware with:
+# `qwen-asr` pulls `triton` into its dependency tree. So `cover` failed on real
+# hardware with:
 #
 #     lyric transcription failed — Failed to find C compiler.
 #     Please specify via CC environment variable or set triton.knobs.build.impl.
 #
+# **What needs the compiler, precisely** — because "triton needs a C compiler"
+# is the wrong summary. Triton compiles GPU kernels with the LLVM bundled in its
+# wheel; no host compiler is involved in that. What it builds at runtime is the
+# host-side *launcher*: `third_party/nvidia/backend/driver.py` calls
+# `compile_module_from_file(src_path=.../"driver.c", name="cuda_utils")` on first
+# use, producing a `cuda_utils.so` that wraps `cuModuleLoad`/`cuLaunchKernel`.
+# `triton/runtime/build.py::_find_compiler` looks for `$CC`, then `clang`, then
+# `gcc`, and raises the message above when all three are absent.
+#
+# That is also why the official installation page lists no C compiler: the wheel
+# is binary and `pip install triton` needs nothing. The requirement is at
+# *runtime*, on the launcher-build path, which is why the error names `CC`.
+#
+# `triton.knobs.build.impl` is not an escape hatch — it is `Optional[BuildImpl]
+# = None`, a Python callable you would have to supply yourself to replace the
+# entire build step. Without writing our own build backend, `_find_compiler` is
+# the only path, so a compiler is genuinely required.
+#
 # Create mode never touched that path, which is why the slim base looked
-# sufficient for as long as it did. The compiler is now installed for the
-# interpreter that needs it, rather than reasoned away.
+# sufficient for as long as it did. The compiler is now installed rather than
+# reasoned away.
 
 FROM python:3.11-slim-trixie
 
@@ -44,12 +61,17 @@ FROM python:3.11-slim-trixie
 # time — inside the handler, not at build, so it fails on the first job rather
 # than at image build.
 #
-# `gcc`/`g++` are a runtime dependency of triton, which JIT-compiles kernels and
-# shells out to a C compiler to build its launcher. They are needed by the
-# cover/edit path only (`qwen-asr` -> triton), but the compiler is a system
-# binary, so one install serves all three environments and the same gap cannot
-# reappear in the sheetsage2 venv later. `--no-install-recommends` still
-# applies: this is a compiler for one build step, not a development toolchain.
+# `gcc` builds triton's runtime launcher, as set out above. `g++` is along for
+# the C++ path in the same module: `_find_compiler("c++")` handles `.cc/.cpp`
+# sources, and although the NVIDIA backend's `driver.c` is C today, a backend
+# that ships C++ would otherwise reintroduce this failure in an environment we
+# are not looking at. Both are system binaries, so one install serves all three
+# environments.
+#
+# `--no-install-recommends` still applies. This is a compiler for one build step,
+# not a development toolchain, and it costs ~1 s per container: the result is
+# cached under `TRITON_HOME`, but containers are ephemeral, so each cold start
+# rebuilds `cuda_utils.so` once.
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends libsndfile1 ffmpeg gcc g++ \
     && rm -rf /var/lib/apt/lists/*
