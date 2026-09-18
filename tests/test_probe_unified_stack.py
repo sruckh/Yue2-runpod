@@ -79,7 +79,7 @@ def test_a_named_attribute_is_checked_not_just_the_module(probe_module) -> None:
     """
     with_attribute = [(m, a, label) for m, a, label in probe_module.PROBES if a is not None]
     assert with_attribute, "no probe checks an attribute — the class existence is unverified"
-    for module_path, attribute, label in with_attribute:
+    for _module_path, attribute, label in with_attribute:
         assert attribute, f"{label}: empty attribute name"
         assert hasattr(probe_module, "probe_imports")
 
@@ -106,7 +106,7 @@ def test_probe_imports_reports_a_missing_attribute(probe_module, monkeypatch) ->
 
     results = probe_module.probe_imports()
     assert len(results) == 1
-    label, ok, detail = results[0]
+    _label, ok, detail = results[0]
     assert not ok
     assert "no attribute" in detail
 
