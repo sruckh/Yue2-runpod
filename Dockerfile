@@ -115,11 +115,57 @@ RUN python -m venv /opt/venvs/qwen3-asr \
     && /opt/venvs/qwen3-asr/bin/python -m pip install --no-cache-dir --upgrade pip \
     && /opt/venvs/qwen3-asr/bin/python -m pip install --no-cache-dir "qwen-asr==0.0.6"
 
-# Each child environment must be able to import its own model library. This
-# fails the build rather than the first cover job, and it is the only check of
-# these environments that can run without a GPU.
-RUN /opt/venvs/sheetsage2/bin/python -c "import torch, transformers; print('sheetsage2', torch.__version__, transformers.__version__)" \
-    && /opt/venvs/qwen3-asr/bin/python -c "import torch, qwen_asr; print('qwen3-asr', torch.__version__)"
+# --- verify all three environments -------------------------------------------------
+#
+# These checks assert; they do not print. The previous versions here did
+# `print(torch.__version__)`, which reports the version without comparing it to
+# anything — so a venv that resolved the wrong torch printed the wrong number and
+# the build passed. The version pin is the entire reason that venv exists, so a
+# check that cannot fail on it is not a check.
+#
+# `check_env.py` reads the pins from the requirements files rather than restating
+# them, and exits non-zero on any mismatch. It also imports each package, which
+# is what catches a wheel that installed cleanly and cannot load — the failure a
+# missing system library produces.
+
+# The main environment, against worker/requirements.txt.
+COPY worker/requirements.txt /tmp/main-requirements.txt
+COPY worker/check_env.py /tmp/check_env.py
+RUN python /tmp/check_env.py --requirements /tmp/main-requirements.txt
+
+# SheetSage2's environment, against its own vendored pins — this is where the
+# torch 2.8.0 pin lives, and where a mis-resolution is most likely.
+COPY worker/transcribe_sheetsage/requirements.txt /tmp/sheetsage-requirements.txt
+RUN /opt/venvs/sheetsage2/bin/python /tmp/check_env.py --requirements /tmp/sheetsage-requirements.txt
+
+# The Qwen3-ASR environment. It declares no torch pin, so there is nothing to
+# assert about which torch it resolved — the checker reports it. What *is*
+# asserted is that the package imports, which is the part a pin can speak to.
+RUN /opt/venvs/qwen3-asr/bin/python -c "import qwen_asr" && echo "qwen3-asr: qwen_asr imports"
+
+# A single summary of all three environments, so the build log states plainly
+# what it produced instead of leaving it scattered across three pip transcripts.
+RUN echo "=== installed environments ===" \
+    && python -c "import sys, importlib.metadata as m; print('  main       py', sys.version.split()[0], '| torch', m.version('torch'), '| transformers', m.version('transformers'), '| yue2-infer', m.version('yue2-infer'))" \
+    && /opt/venvs/sheetsage2/bin/python -c "import sys, importlib.metadata as m; print('  sheetsage2 py', sys.version.split()[0], '| torch', m.version('torch'), '| transformers', m.version('transformers'), '| numpy', m.version('numpy'))" \
+    && /opt/venvs/qwen3-asr/bin/python -c "import sys, importlib.metadata as m; print('  qwen3-asr  py', sys.version.split()[0], '| torch', m.version('torch'), '| transformers', m.version('transformers'))" \
+    && echo "=============================="
+
+# --- the unification experiment -----------------------------------------------------
+#
+# Does SheetSage2's code load under YuE2's stack instead of its own pins? If it
+# does, the three environments can collapse into one and the image loses two
+# torch installs. If it does not, the split is required and we will know exactly
+# which import broke.
+#
+# This RUN is deliberately NON-FATAL. It reports; it does not gate. The split
+# stack is what ships today, so a failure here is information rather than a
+# build error — and making it fatal before we know the answer would mean a red
+# build that says nothing about whether the *product* is broken.
+#
+# Read the result in the Builds tab: `VERDICT: ...` near the end of this step.
+COPY worker/transcribe_sheetsage/probe_unified_stack.py /tmp/probe_unified_stack.py
+RUN python /tmp/probe_unified_stack.py --offline || echo "probe: unified stack NOT viable (see VERDICT above)"
 
 # Handler code last — it changes most often, so it invalidates the least.
 COPY worker/ /app/
