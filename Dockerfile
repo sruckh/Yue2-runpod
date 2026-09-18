@@ -151,7 +151,14 @@ RUN pip install --no-cache-dir --upgrade "huggingface-hub==0.36.2" \
 # Its declared `gradio`, `flask` and `vllm` are deliberately absent: they are the
 # CLI and the optional vllm backend, and the one inference-path vllm import sits
 # inside a `try/except`.
+#
+# Asserted here rather than by `check_env` reading a pins file, because it is
+# installed outside that file on purpose — so nothing else would notice a wrong
+# version. This is the check that would have caught the build failure that put
+# `qwen-asr` in `requirements.txt`: it names the version, so a change to it fails
+# here instead of silently resolving something else.
 RUN pip install --no-cache-dir --no-deps "qwen-asr==0.0.6" \
+    && python -c "import qwen_asr, importlib.metadata as m, sys; sys.exit(0 if m.version('qwen-asr') == '0.0.6' else 'expected 0.0.6')" \
     && python -c "import qwen_asr; print('qwen_asr importable in the main environment')"
 
 # --- isolated model-family environments (cover mode) --------------------------

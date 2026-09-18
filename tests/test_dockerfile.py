@@ -380,3 +380,82 @@ def test_the_asr_environment_is_asserted_at_build_time(dockerfile: str) -> None:
     assert "check_env.py --requirements /tmp/asr-requirements.txt" in dockerfile, (
         "the Qwen3-ASR environment is installed but its pins are never verified"
     )
+
+
+# =============================================================================
+# qwen-asr is installed outside the resolved requirements file
+# =============================================================================
+#
+# A build failed with:
+#
+#     ERROR: Cannot install -r /app/requirements.txt (line 79) and
+#     accelerate==1.13.0 because these package versions have conflicting
+#     dependencies.
+#         The user requested accelerate==1.13.0
+#         qwen-asr 0.0.6 depends on accelerate==1.12.0
+#     ERROR: ResolutionImpossible
+#
+# `qwen-asr` had been added to `worker/requirements.txt`, which the Dockerfile
+# installs with **full dependency resolution** — so pip resolved its tree and hit
+# exactly the conflict the `--no-deps` step was meant to avoid. The `--no-deps`
+# install came later in the file and never got the chance.
+#
+# The two accelerate pins are decorative on both sides (zero references in either
+# wheel), so the fix is to keep qwen-asr out of the resolved file rather than to
+# loosen anything.
+
+REQUIREMENTS = REPO_ROOT / "worker" / "requirements.txt"
+
+
+def test_qwen_asr_is_not_in_the_resolved_requirements_file() -> None:
+    """Listing it there makes pip resolve its tree, which cannot succeed.
+
+    `accelerate==1.12.0` (qwen-asr) and `accelerate==1.13.0` (yue2_infer) are both
+    exact pins. pip cannot satisfy both, so the build aborts rather than choosing.
+    """
+    pins = dict(check_env.parse_requirements(REQUIREMENTS))
+    assert "qwen-asr" not in pins, (
+        "qwen-asr is in requirements.txt, which is installed with full dependency "
+        "resolution. Its accelerate pin conflicts with yue2_infer's and the build "
+        "will fail with ResolutionImpossible. Install it with --no-deps instead."
+    )
+
+
+def test_qwen_asr_is_installed_with_no_deps(dockerfile: str) -> None:
+    """And it must still actually be installed, or the experiment cannot run."""
+    assert 'pip install --no-cache-dir --no-deps "qwen-asr==0.0.6"' in dockerfile, (
+        "qwen-asr is not installed --no-deps anywhere, so the main environment "
+        "cannot import it and the unification toggle would fail at runtime"
+    )
+
+
+def test_the_no_deps_install_comes_after_the_requirements_file(dockerfile: str) -> None:
+    """Order is the mechanism: the pin must not be visible to the resolver.
+
+    If qwen-asr were installed before `requirements.txt`, pip would still resolve
+    the tree and still abort.
+    """
+    requirements_at = dockerfile.index("pip install --no-cache-dir -r /app/requirements.txt")
+    no_deps_at = dockerfile.index('--no-deps "qwen-asr==0.0.6"')
+    assert requirements_at < no_deps_at
+
+
+def test_the_no_deps_install_asserts_its_version(dockerfile: str) -> None:
+    """Nothing else checks it, since it is outside the pins file.
+
+    A version installed outside the file that `check_env` reads is a version
+    nothing verifies — the same shape as the unpinned torch this session already
+    fixed once.
+    """
+    assert "expected 0.0.6" in dockerfile, "the --no-deps install does not assert its version"
+
+
+def test_the_runtime_deps_of_qwen_asr_are_still_pinned() -> None:
+    """`--no-deps` means we supply them, so they must be in the resolved file.
+
+    Skipping the dependency tree is only safe while its real requirements are
+    satisfied by hand.
+    """
+    pins = dict(check_env.parse_requirements(REQUIREMENTS))
+    for dep in ("nagisa", "soynlp", "librosa"):
+        assert dep in pins, f"{dep} is needed by qwen_asr but no longer pinned"

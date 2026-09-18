@@ -56,27 +56,26 @@ mir_eval==0.8.2
 pretty_midi==0.2.10
 mido==1.3.3
 
-# --- Qwen3-ASR, for the unification experiment -------------------------------
+# --- Qwen3-ASR's runtime dependencies, for the unification experiment ---------
 #
-# `cover`'s lyric transcription currently runs in its own venv
+# `cover`'s lyric transcription normally runs in its own venv
 # (`/opt/venvs/qwen3-asr`). The unification question is whether it can run here
 # instead, which would delete a ~5 GB environment.
 #
-# Installed with `--no-deps` in the Dockerfile, and the reason is evidence
-# rather than convenience. `qwen-asr==0.0.6` pins `accelerate==1.12.0` while the
-# YuE2 wheel pins `accelerate==1.13.0` — two exact pins that cannot both hold.
-# But **neither package imports accelerate**: grepping both wheels gives zero
-# references, so the conflicting pin is decorative on both sides and blocking on
-# it would be blocking on nothing.
+# **`qwen-asr` itself is deliberately NOT in this file.** This file is installed
+# with full dependency resolution, and `qwen-asr==0.0.6` pins
+# `accelerate==1.12.0` while the YuE2 wheel pins `accelerate==1.13.0` — two exact
+# pins that cannot both hold, so pip aborts with `ResolutionImpossible`. Listing
+# it here failed a build exactly that way. It is installed with `--no-deps` in
+# the Dockerfile instead, after this file, which sidesteps a conflict between two
+# pins that neither package actually uses.
 #
-# The deps below are what `qwen_asr` actually imports at runtime, read from its
-# wheel with `ast` rather than from its declared list. Its declared `gradio`,
-# `flask` and `vllm` are the CLI and the optional vllm backend (the one
-# inference-path import is inside a `try/except`), and `pytz`, `sox`,
-# `qwen_omni_utils` and `accelerate` are declared but never imported.
-#
-# Whether it *runs* here is the experiment; this only makes it importable.
-qwen-asr==0.0.6
+# The pins below are what `qwen_asr` really imports, read from its wheel with
+# `ast` rather than from its declared list. Its declared `gradio`, `flask` and
+# `vllm` are the CLI and the optional vllm backend (the one inference-path
+# `vllm` import sits inside a `try/except`), and `pytz`, `sox`, `qwen_omni_utils`
+# and `accelerate` are declared and never imported — which is why none of them
+# are here. `numpy`, `scipy` and `torch` it also imports are already pinned above.
 nagisa==0.2.11
 soynlp==0.0.493
 librosa==0.11.0
