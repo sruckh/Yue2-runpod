@@ -219,3 +219,79 @@ def test_sheetsage_requirements_are_vendored_not_fetched(dockerfile: str) -> Non
     assert "huggingface.co/m-a-p/SheetSage2/resolve" not in dockerfile, (
         "the requirements are fetched from a URL at build time again"
     )
+
+
+# =============================================================================
+# The compiler triton needs at runtime
+# =============================================================================
+#
+# A live cover job failed 50 s in with:
+#
+#     lyric transcription failed — Failed to find C compiler.
+#     Please specify via CC environment variable or set triton.knobs.build.impl.
+#
+# Triton JIT-compiles CUDA kernels and needs a host C compiler. The image
+# installed only `libsndfile1 ffmpeg`, because the Dockerfile's own reasoning
+# about `triton` — that it appears only in the `yue2/fast.py` vLLM extra — was
+# correct for YuE2 and had been generalised to the whole image. `qwen-asr` pulls
+# triton into its own dependency tree.
+
+
+def test_a_c_compiler_is_installed(dockerfile: str) -> None:
+    """`gcc` must be in the apt install line, not merely assumed.
+
+    A comment in this Dockerfile once argued the slim base was sufficient
+    *because* nothing in YuE2 needs triton. That argument was about one of the
+    three environments.
+    """
+    installs = [
+        line for line in dockerfile.splitlines() if "apt-get install" in line and not line.strip().startswith("#")
+    ]
+    assert installs, "no apt-get install line found"
+    joined = " ".join(installs)
+    assert "gcc" in joined, (
+        "gcc is not installed. Triton JIT-compiles kernels at runtime and shells "
+        "out to a C compiler; without one, cover/edit fail inside a GPU job."
+    )
+
+
+def test_the_compiler_is_verified_at_build_time(dockerfile: str) -> None:
+    """A mistyped package name must fail the build, not the job.
+
+    The failure this guards against costs a cold start, ~50 s of GPU time, and a
+    round trip through the build system to discover.
+    """
+    assert "gcc --version" in dockerfile, "the compiler is installed but never checked"
+
+
+def test_the_compiler_env_vars_are_set(dockerfile: str) -> None:
+    """Triton's own error message asks for `CC`.
+
+    `gcc` would be found via the default PATH that `exec` falls back to, but the
+    subprocess runner hands its children a curated environment, so naming it
+    removes the question.
+    """
+    assert "CC=gcc" in dockerfile
+    assert "CXX=g++" in dockerfile
+
+
+def test_env_variables_are_asserted_not_assumed(dockerfile: str) -> None:
+    """The ENV block must be proven to have parsed as written.
+
+    The block previously carried comment lines *inside* its continuation,
+    including between `HF_HUB_DISABLE_TELEMETRY=1` and `HF_HOME=...`. Whether
+    Docker strips such comments before joining or joins first — making `#`
+    swallow the rest of the instruction — could not be settled by reading, and
+    `config.CacheConfig` sets the same paths at runtime, so nothing failed loudly
+    enough to reveal which had happened. The comments are hoisted out and the
+    values are now asserted at build time.
+    """
+    assert "env verified" in dockerfile, "the ENV block is never verified"
+    # And the block itself must be comment-free.
+    env_block = dockerfile[dockerfile.index("ENV PYTHONUNBUFFERED") :]
+    env_block = env_block[: env_block.index("\n\n")]
+    for line in env_block.splitlines():
+        assert not line.strip().startswith("#"), (
+            f"a comment sits inside the ENV continuation: {line!r}. Docker's handling "
+            "of that is exactly what this check exists because we could not confirm."
+        )

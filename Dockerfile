@@ -22,8 +22,20 @@
 # requirement. It is not one — grepping the `yue2_infer-0.1.5` wheel source
 # finds no `flash_attn` import at all, and `triton` appears only inside
 # `yue2/fast.py`, which is the separate `fast` (vLLM) extra we deliberately do
-# not install. The HF path goes through PyTorch's own SDPA. That is why the
-# slim base is sufficient and why there is no multi-hour attention build here.
+# not install. The HF path goes through PyTorch's own SDPA.
+#
+# **That reasoning was correct for YuE2 and was wrongly generalised to the
+# whole image.** It says nothing about the other two environments, and
+# `qwen-asr` pulls `triton` into its dependency tree. Triton JIT-compiles CUDA
+# kernels at runtime and needs a host C compiler to do it, so `cover` failed on
+# real hardware with:
+#
+#     lyric transcription failed — Failed to find C compiler.
+#     Please specify via CC environment variable or set triton.knobs.build.impl.
+#
+# Create mode never touched that path, which is why the slim base looked
+# sufficient for as long as it did. The compiler is now installed for the
+# interpreter that needs it, rather than reasoned away.
 
 FROM python:3.11-slim-trixie
 
@@ -31,22 +43,52 @@ FROM python:3.11-slim-trixie
 # uses to write the 48 kHz FLAC. Without it `import soundfile` raises at import
 # time — inside the handler, not at build, so it fails on the first job rather
 # than at image build.
+#
+# `gcc`/`g++` are a runtime dependency of triton, which JIT-compiles kernels and
+# shells out to a C compiler to build its launcher. They are needed by the
+# cover/edit path only (`qwen-asr` -> triton), but the compiler is a system
+# binary, so one install serves all three environments and the same gap cannot
+# reappear in the sheetsage2 venv later. `--no-install-recommends` still
+# applies: this is a compiler for one build step, not a development toolchain.
 RUN apt-get update \
-    && apt-get install --yes --no-install-recommends libsndfile1 ffmpeg \
+    && apt-get install --yes --no-install-recommends libsndfile1 ffmpeg gcc g++ \
     && rm -rf /var/lib/apt/lists/*
+
+# `CC`/`CXX` name the compiler for triton, whose own error message asks for
+# exactly this. `gcc` would be found anyway via the default PATH that `exec`
+# falls back to when an environment lacks one, but `subprocess_runner` hands the
+# children a curated environment and naming it removes the question entirely.
+#
+# Verified below rather than assumed: a mistyped package name would otherwise
+# surface as the same runtime failure this change exists to fix.
+# The compiler triton needs must actually be present and runnable. This is a
+# build-time assertion on purpose: the failure it guards against is a JIT
+# compile inside a GPU job 50 seconds in, which is both slower to discover and
+# more expensive than a red build here.
+RUN gcc --version > /dev/null && g++ --version > /dev/null \
+    && echo "compiler present: $(gcc -dumpversion)" \
+    && python -c "import shutil,sys; sys.exit(0 if shutil.which('gcc') else 'gcc not on PATH')"
+
+# Every variable the ENV block above claims to set must actually be set.
+#
+# `HF_HOME` is the discriminator for the comment question: if Docker had joined
+# the comment lines into the instruction rather than stripping them, the `#` would
+# have swallowed everything after it and `HF_HOME` would be unset. Plain shell,
+# no clever quoting — the first version of this check was a Python one-liner that
+# `bash -n` rejected, which is the test suite doing its job.
+RUN test "$PYTHONUNBUFFERED" = "1" \
+    && test "$CC" = "gcc" \
+    && test "$CXX" = "g++" \
+    && test "$HF_HUB_DISABLE_TELEMETRY" = "1" \
+    && test "$HF_HOME" = "/runpod-volume/huggingface-cache" \
+    && echo "env verified: CC=$CC CXX=$CXX HF_HOME=$HF_HOME"
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
+    CC=gcc \
+    CXX=g++ \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     HF_HUB_DISABLE_TELEMETRY=1 \
-    # Point HuggingFace at RunPod's cache location. `config.CacheConfig` derives
-    # the same paths from VOLUME_ROOT at runtime and is authoritative; this is a
-    # belt-and-braces default so that even a step running before `apply_hf_env()`
-    # writes to the volume rather than filling the container disk.
-    #
-    # Keep in sync with CacheConfig.hf_home. The build cannot check that, and a
-    # divergence would be silent — which is exactly how the previous value
-    # (/runpod-volume/hf) sat here unnoticed while the code used a different path.
     HF_HOME=/runpod-volume/huggingface-cache
 
 WORKDIR /app
