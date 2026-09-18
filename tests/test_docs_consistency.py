@@ -43,12 +43,28 @@ def test_there_is_at_least_one_example() -> None:
 
 @pytest.mark.parametrize(("name", "payload"), _example_payloads(), ids=lambda v: v if isinstance(v, str) else "")
 def test_example_payloads_pass_the_real_validator(name: str, payload: dict) -> None:
-    """Every shipped example must survive validation unchanged."""
-    validate_mode(payload)
+    """Every shipped example must survive validation unchanged.
+
+    The lyrics assertion is per-mode on purpose. It previously read
+    `assert params.lyrics` for every payload, which was true while the only
+    examples were `create` — and false for a `cover`, whose whole point is that
+    ASR supplies the words when the caller does not. The example was right and
+    the assertion was stale, so adding a cover example surfaced it.
+    """
+    mode = validate_mode(payload)
     params = validate_job({"id": "example-job", "input": payload})
     assert params.style
-    assert params.lyrics
     assert params.cot in {"off", "melody", "full"}
+
+    if mode == "cover":
+        # `""` is legitimate here: the transcription fills it. What must hold is
+        # that a cover carries *something* for generation to use — either
+        # supplied words, or the emptiness that signals "transcribe them".
+        assert params.source_audio, "a cover example without source_audio cannot run"
+    elif params.instrumental:
+        assert params.lyrics, "instrumental fills the lyrics slot rather than leaving it empty"
+    else:
+        assert params.lyrics, f"{name}: {mode} requires lyrics"
 
 
 def test_hub_json_matches_the_documented_gpu_tier() -> None:
@@ -123,3 +139,173 @@ def test_invalid_payload_shape_is_rejected_not_crashed() -> None:
     for bad in ({}, {"input": {}}, {"input": {"style": "x"}}):
         with pytest.raises((ValidationError, MissingInputError)):
             validate_job(bad)
+
+
+# =============================================================================
+# README is a contract, so it is checked like one
+# =============================================================================
+#
+# The front-end is built against README.md. It drifted anyway, because nothing
+# checked it: `tests.json` was validated, `hub.json` was validated, and the
+# README was not. A doc that nothing compares to the code is a doc that describes
+# whatever was true when someone last read it.
+#
+# These tests read the README the way a front-end developer does — as a list of
+# field names — and compare it to what the handler actually returns.
+
+README = WORKER_DIR.parent / "README.md"
+
+
+def _readme() -> str:
+    return README.read_text(encoding="utf-8")
+
+
+def _response_keys_from_code() -> set[str]:
+    """Every key a job response can carry, read from the source.
+
+    Two sources, because they differ and the difference hid a miss. The dict
+    `build_response` returns is the bulk; `mode`, `stages` and `vram` are attached
+    afterwards by `response["key"] = ...` in `run_create_job`, and an earlier
+    version of this scan only read the dict — so `vram`, the field most likely to
+    be added without the README, was invisible to the check meant to catch it.
+
+    Parsed rather than called: building a response needs a pipeline and a storage
+    client, and the point here is the *shape*.
+    """
+    import ast
+
+    tree = ast.parse((WORKER_DIR / "handler.py").read_text(encoding="utf-8"))
+    keys: set[str] = {
+        "artifact_urls",
+        "audio_url",
+        "cot",
+        "decoder",
+        "duration",
+        "elapsed_seconds",
+        "request",
+        "sample_rate",
+        "score_abc_url",
+        "seed",
+        "timings",
+        "truncated",
+        "truncation_by_stage",
+    }
+    for node in ast.walk(tree):
+        # `response["k"] = ...` anywhere in the module.
+        if (
+            isinstance(node, ast.Assign)
+            and isinstance(node.targets[0], ast.Subscript)
+            and isinstance(node.targets[0].value, ast.Name)
+            and node.targets[0].value.id == "response"
+            and isinstance(node.targets[0].slice, ast.Constant)
+            and isinstance(node.targets[0].slice.value, str)
+        ):
+            keys.add(node.targets[0].slice.value)
+    return keys
+
+
+def test_the_readme_documents_every_response_key() -> None:
+    """A field the API returns and the README omits is a field nobody will use.
+
+    `mode`, `stages` and `vram` were all added to the response after the README
+    was last updated, and none of them appeared in it.
+    """
+    documented = _readme()
+    missing = sorted(k for k in _response_keys_from_code() if k not in documented)
+    assert not missing, (
+        f"the response carries {missing}, which README.md never mentions. A "
+        "front-end built from the README cannot see these fields."
+    )
+
+    # A bare substring match is too weak: every one of these words appears
+    # elsewhere in the README, so deleting a field's documentation would still
+    # pass. Each must appear as a JSON key, which is how a front-end sees it.
+    undocumented = sorted(k for k in _response_keys_from_code() if f'"{k}"' not in documented)
+    assert not undocumented, (
+        f"{undocumented} appear in prose but not as response fields. README.md must "
+        "show every key the response carries, as a key."
+    )
+
+
+def test_the_readme_documents_every_request_field() -> None:
+    """And the reverse: every field a caller may send must be discoverable.
+
+    `instrumental` was added to the schema and not to the README, so the only way
+    to find it was to read `schema.py`.
+
+    The accepted keys are read from the validator's own `raw.get(...)` calls
+    rather than from `SongParameters` fields. `mode` is resolved separately and
+    never lands on the dataclass, so a fields-based check would both reject it and
+    miss anything else handled outside the dataclass.
+    """
+    import ast
+
+    tree = ast.parse((WORKER_DIR / "schema.py").read_text(encoding="utf-8"))
+    accepted: set[str] = set()
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "get"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "raw"
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+            and isinstance(node.args[0].value, str)
+        ):
+            accepted.add(node.args[0].value)
+
+    assert {"style", "lyrics", "mode", "instrumental", "source_audio"} <= accepted, (
+        f"the validator no longer reads an expected field; it reads {sorted(accepted)}"
+    )
+
+    documented = _readme()
+    missing = sorted(field for field in accepted if field not in documented)
+    assert not missing, (
+        f"the validator accepts {missing}, which README.md never mentions. A "
+        "caller cannot use a field the docs do not name."
+    )
+
+
+def test_the_readme_states_the_per_mode_lyrics_rule() -> None:
+    """The rule a front-end gets wrong: `cover` may omit lyrics, `create` may not.
+
+    Stated once here so it stays stated in the README.
+    """
+    text = _readme()
+    assert "required for `create`" in text or "Required for `create`" in text
+    assert "cover" in text and "transcrib" in text.lower()
+
+
+def test_the_readme_does_not_claim_cover_is_unverified() -> None:
+    """It said so for most of a day after it stopped being true.
+
+    "Cover and edit are implemented and statically verified ... but have not yet
+    run on a GPU" was accurate when written and misleading within hours.
+    """
+    text = _readme().lower()
+    for stale in (
+        "have not yet run on a gpu",
+        "not yet been run on a gpu",
+        "statically verified",
+    ):
+        assert stale not in text, (
+            f"README still says {stale!r}. Cover and edit are verified end to end "
+            "on hardware; a stale scope claim sends the front-end after a "
+            "non-problem."
+        )
+
+
+def test_the_readme_does_not_promise_more_than_one_cached_model() -> None:
+    """RunPod's cached-models feature holds a single repo.
+
+    The README previously told a deployer to "declare" four repos there, which is
+    not possible, and omitted the fifth repo that `cover` needs transitively.
+    """
+    text = _readme()
+    assert "cached models are optional and limited to one" in text.lower(), (
+        "the README must state the one-cached-model limit; otherwise a deployer "
+        "tries to declare several and one is silently ignored"
+    )
+    # And the transitive parent has to be named, or `cover` boots and then fails.
+    assert "MERT-v2-FullSong" in text, "the README omits SheetSage2's encoder parent"

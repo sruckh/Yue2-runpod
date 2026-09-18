@@ -28,6 +28,56 @@
         "seed": 42,
         "abc": "X:1\nT:Supplied melody\nM:4/4\nL:1/4\nK:C\nC D E F | G A G F | E D C2 |"
       }
+    },
+    {
+      "name": "create_instrumental",
+      "input": {
+        "style": "Ambient piano, no vocals, sparse and slow, long reverb tails",
+        "instrumental": true,
+        "cot": "off",
+        "seed": 4242
+      }
+    },
+    {
+      "name": "edit_from_supplied_score",
+      "input": {
+        "mode": "edit",
+        "abc": "X:1\nT:Supplied\nM:4/4\nL:1/4\nK:Bb\n\"Bb\"B,4 F4|\"Dm7\"D4 A4|\"Eb\"E4 G4|\"Bb\"F8|",
+        "style": "stripped-back piano, slower, more space between phrases",
+        "lyrics": "[Verse]\nPaper lanterns drifting down the stream\n[Chorus]\nHold the light a little longer",
+        "cot": "full",
+        "seed": 5150
+      }
+    },
+    {
+      "name": "edit_plan_only",
+      "input": {
+        "mode": "edit",
+        "style": "solo cello, rubato, intimate room",
+        "lyrics": "[Verse]\nA quiet room, a single line",
+        "cot": "full",
+        "seed": 77
+      }
+    },
+    {
+      "name": "cover_from_url",
+      "input": {
+        "mode": "cover",
+        "source_audio": "https://example.invalid/reference.flac",
+        "style": "Jazz-funk, Rhodes piano, brushed drums",
+        "cot": "melody",
+        "seed": 1234
+      }
+    },
+    {
+      "name": "cover_with_supplied_lyrics",
+      "input": {
+        "mode": "cover",
+        "source_audio": "https://example.invalid/reference.flac",
+        "style": "Jazz-funk, Rhodes piano, brushed drums",
+        "lyrics": "[Verse]\nWords a listener already knows",
+        "seed": 1234
+      }
     }
   ]
 }
