@@ -46,6 +46,7 @@ _CONFIG_CACHE = CacheConfig()
 _CONFIG_CACHE.apply_hf_env()
 
 import runpod  # noqa: E402 - must follow apply_hf_env()
+from vram import DEFAULT_INTERVAL_SECONDS, VramSampler  # noqa: E402
 
 import boot  # noqa: E402 - must follow apply_hf_env()
 import modes  # noqa: E402
@@ -389,6 +390,15 @@ def run_create_job(
     # uniqueness comes from this process, which the caller cannot influence.
     workdir = _CONFIG_CACHE.models_dir / f"{params.id}-{uuid.uuid4().hex[:12]}"
 
+    # Device-wide memory sampling for the life of this job. The Stage 03 Human
+    # check asks for evidence that no cover/edit stage exceeds the create-job
+    # peak, and that is a claim about the *device* while child processes come
+    # and go — not something any one process can observe about itself. See
+    # worker/vram.py. Sampling is skipped, not failed, where nvidia-smi is
+    # absent; a job must never fail because its instrument was missing.
+    sampler = VramSampler(_vram_interval())
+    sampler.start()
+
     try:
         _reset_dir(workdir)
 
@@ -402,6 +412,7 @@ def run_create_job(
             # before either transcription environment is started.
             if mode == COVER:
                 params = replace(params, source_audio=_fetch_source_audio(params, job_id))
+            sampler.mark("transcribe")
             prepared = modes.dispatch(mode, params, workdir)
             if prepared.score_abc is not None:
                 params = replace(params, abc=prepared.score_abc)
@@ -420,7 +431,9 @@ def run_create_job(
         else:
             mode_stages = {}
 
+        sampler.mark("generate")
         generation = generate(params, workdir, config)
+        sampler.mark("upload")
         artifacts = bucket.upload_directory(workdir, job_prefix(job_id, params.id))
         # Built inside the `try`, and *before* cleanup: assembling the response
         # can fail, and a local-storage run returns `file://` URLs that would
@@ -429,18 +442,42 @@ def run_create_job(
         response["mode"] = mode
         if mode_stages:
             response["stages"] = mode_stages
+        vram = sampler.stop()
+        response["vram"] = vram.to_dict()
+        log.info("job %s %s", job_id, vram.render())
     # `boot.BootError` and `BootFailedError` are included deliberately: a failed
     # model cache or a missing wheel is a job failure the caller should see as
     # `{"error": ...}`, not a traceback out of the handler. Omitting `BootError`
     # once meant a cold-start failure escaped as an unhandled exception.
     except (WorkerError, StorageError, ConfigError, boot.BootError, modes.ModeError) as exc:
         log.exception("job %s failed", job_id)
-        return {"error": str(exc)}
+        # A failed job is exactly when a VRAM peak is worth having: "it died
+        # after the transcription stage" is diagnosable, "it died" is not.
+        vram = sampler.stop()
+        log.info("job %s (failed) %s", job_id, vram.render())
+        return {"error": str(exc), "vram": vram.to_dict()}
     finally:
         _cleanup(workdir)
 
     log.info("job %s complete: %s", job_id, response["audio_url"])
     return response
+
+
+def _vram_interval() -> float:
+    """Sampling period, from the environment, with a floor.
+
+    The floor matters: a zero interval would spin `nvidia-smi` as fast as the
+    process can fork, which costs more than the job it is measuring and could
+    starve the generation thread of CPU.
+    """
+    raw = os.environ.get("VRAM_SAMPLE_INTERVAL_SECONDS")
+    if raw is None:
+        return DEFAULT_INTERVAL_SECONDS
+    try:
+        return max(0.05, float(raw))
+    except ValueError:
+        log.warning("VRAM_SAMPLE_INTERVAL_SECONDS=%r is not a number; using %s", raw, DEFAULT_INTERVAL_SECONDS)
+        return DEFAULT_INTERVAL_SECONDS
 
 
 def _reset_dir(path: Path) -> None:
