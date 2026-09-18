@@ -59,9 +59,11 @@ def test_multiple_devices_report_the_busiest(monkeypatch: pytest.MonkeyPatch) ->
     on a 2-GPU worker would silently understate the peak on the card that
     actually ran the job.
     """
-    fake = subprocess.CompletedProcess(args=vram._QUERY, returncode=0, stdout="1000, 24564\n9000, 24564\n", stderr="")
+    fake = subprocess.CompletedProcess(
+        args=vram._QUERY, returncode=0, stdout="1000, 24564, NVIDIA L4\n9000, 24564, NVIDIA L4\n", stderr=""
+    )
     monkeypatch.setattr(vram.subprocess, "run", lambda *a, **k: fake)
-    assert vram._read_device_memory() == (9000, 24564)
+    assert vram._read_device_memory() == (9000, 24564, "NVIDIA L4")
 
 
 def test_a_failed_query_is_none_not_zero(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -86,7 +88,7 @@ def test_a_missing_nvidia_smi_is_none(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_unparseable_output_is_none(monkeypatch: pytest.MonkeyPatch) -> None:
-    fake = subprocess.CompletedProcess(args=vram._QUERY, returncode=0, stdout="[N/A], [N/A]\n", stderr="")
+    fake = subprocess.CompletedProcess(args=vram._QUERY, returncode=0, stdout="[N/A], [N/A], [N/A]\n", stderr="")
     monkeypatch.setattr(vram.subprocess, "run", lambda *a, **k: fake)
     assert vram._read_device_memory() is None
 
@@ -135,9 +137,9 @@ def test_peak_is_the_maximum_not_the_last(monkeypatch: pytest.MonkeyPatch) -> No
     A sampler that reported the final reading would show a small number after a
     tall spike, and every stage would look like it passed.
     """
-    readings = iter([(1000, 24564), (12000, 24564), (3000, 24564)])
+    readings = iter([(1000, 24564, "NVIDIA L4"), (12000, 24564, "NVIDIA L4"), (3000, 24564, "NVIDIA L4")])
     monkeypatch.setattr(vram, "available", lambda: (True, ""))
-    monkeypatch.setattr(vram, "_read_device_memory", lambda: next(readings, (3000, 24564)))
+    monkeypatch.setattr(vram, "_read_device_memory", lambda: next(readings, (3000, 24564, "NVIDIA L4")))
 
     sampler = vram.VramSampler(interval=0.01)
     sampler.start()
@@ -157,7 +159,7 @@ def test_phases_are_attributed_separately(monkeypatch: pytest.MonkeyPatch) -> No
     seen: dict[str, int] = {}
 
     def fake_read():
-        return seen.get("value", 0), 24564
+        return seen.get("value", 0), 24564, "NVIDIA L4"
 
     monkeypatch.setattr(vram, "available", lambda: (True, ""))
     monkeypatch.setattr(vram, "_read_device_memory", fake_read)
@@ -196,7 +198,7 @@ def test_it_captures_a_peak_from_a_child_process(monkeypatch: pytest.MonkeyPatch
 
     def fake_read():
         with lock:
-            return state["used"], 24564
+            return state["used"], 24564, "NVIDIA L4"
 
     monkeypatch.setattr(vram, "available", lambda: (True, ""))
     monkeypatch.setattr(vram, "_read_device_memory", fake_read)
@@ -240,7 +242,7 @@ def test_a_sampling_failure_does_not_kill_the_thread(monkeypatch: pytest.MonkeyP
         calls["n"] += 1
         if calls["n"] < 3:
             raise RuntimeError("transient driver error")
-        return 7000, 24564
+        return 7000, 24564, "NVIDIA L4"
 
     monkeypatch.setattr(vram, "available", lambda: (True, ""))
     monkeypatch.setattr(vram, "_read_device_memory", flaky)
@@ -259,7 +261,7 @@ def test_the_report_is_json_serialisable(monkeypatch: pytest.MonkeyPatch) -> Non
     import json
 
     monkeypatch.setattr(vram, "available", lambda: (True, ""))
-    monkeypatch.setattr(vram, "_read_device_memory", lambda: (8192, 24564))
+    monkeypatch.setattr(vram, "_read_device_memory", lambda: (8192, 24564, "NVIDIA L4"))
 
     sampler = vram.VramSampler(interval=0.01)
     sampler.start()
@@ -274,7 +276,7 @@ def test_the_report_is_json_serialisable(monkeypatch: pytest.MonkeyPatch) -> Non
 def test_render_names_the_phases(monkeypatch: pytest.MonkeyPatch) -> None:
     """The log line is what a human reads while watching a build."""
     monkeypatch.setattr(vram, "available", lambda: (True, ""))
-    monkeypatch.setattr(vram, "_read_device_memory", lambda: (4096, 24564))
+    monkeypatch.setattr(vram, "_read_device_memory", lambda: (4096, 24564, "NVIDIA L4"))
 
     sampler = vram.VramSampler(interval=0.01)
     sampler.start()
@@ -285,3 +287,94 @@ def test_render_names_the_phases(monkeypatch: pytest.MonkeyPatch) -> None:
     rendered = report.render()
     assert "generate" in rendered
     assert "4096" in rendered
+
+
+# =============================================================================
+# The report must say which device produced it
+# =============================================================================
+#
+# The GPU pool behind this endpoint is not homogeneous: the same endpoint has
+# reported device totals of 23034 MiB and 24564 MiB, from an L4-class card and a
+# larger one, both sold as the same "24 GB" tier. A peak with no card attached
+# cannot be compared against another peak — which is exactly what the Stage 03
+# check asks someone to do.
+#
+# MIG makes this sharper. A MIG instance is a partitioned slice; it is not
+# certain that `nvidia-smi --query-gpu=memory.*` inside such a container reports
+# the *slice* rather than the *parent*. If it reports the parent, the peak
+# describes a machine the job did not run on.
+
+
+def test_the_card_name_is_captured(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = subprocess.CompletedProcess(args=vram._QUERY, returncode=0, stdout="900, 23034, NVIDIA L4\n", stderr="")
+    monkeypatch.setattr(vram.subprocess, "run", lambda *a, **k: fake)
+    assert vram._read_device_memory() == (900, 23034, "NVIDIA L4")
+
+
+def test_a_name_containing_a_comma_is_not_truncated(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Some drivers' names carry punctuation; the name is the whole remainder."""
+    fake = subprocess.CompletedProcess(
+        args=vram._QUERY, returncode=0, stdout="900, 97871, NVIDIA RTX PRO 6000, MIG 1g.24gb\n", stderr=""
+    )
+    monkeypatch.setattr(vram.subprocess, "run", lambda *a, **k: fake)
+    reading = vram._read_device_memory()
+    assert reading is not None
+    assert reading[2] == "NVIDIA RTX PRO 6000, MIG 1g.24gb", reading[2]
+
+
+def test_the_report_carries_the_name_and_mig_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(vram, "available", lambda: (True, ""))
+    monkeypatch.setattr(vram, "mig_mode", lambda: "Enabled")
+    monkeypatch.setattr(vram, "_read_device_memory", lambda: (8192, 97871, "NVIDIA RTX PRO 6000"))
+
+    sampler = vram.VramSampler(interval=0.01)
+    sampler.start()
+    time.sleep(0.1)
+    payload = sampler.stop().to_dict()
+
+    assert payload["device_name"] == "NVIDIA RTX PRO 6000"
+    assert payload["mig_mode"] == "Enabled"
+    # The log line's own coverage lives in the next test; asserting it here with
+    # an `or True` tail would be a check that cannot fail.
+
+
+def test_render_names_the_device_and_flags_mig(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The log line is what a human reads; it must carry the caveat too."""
+    monkeypatch.setattr(vram, "available", lambda: (True, ""))
+    monkeypatch.setattr(vram, "mig_mode", lambda: "Enabled")
+    monkeypatch.setattr(vram, "_read_device_memory", lambda: (4096, 97871, "NVIDIA RTX PRO 6000"))
+
+    sampler = vram.VramSampler(interval=0.01)
+    sampler.start()
+    time.sleep(0.1)
+    rendered = sampler.stop().render()
+
+    assert "NVIDIA RTX PRO 6000" in rendered
+    assert "MIG=Enabled" in rendered, "a MIG reading must be flagged where a human will see it"
+
+
+def test_a_non_mig_reading_is_not_flagged(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(vram, "available", lambda: (True, ""))
+    monkeypatch.setattr(vram, "mig_mode", lambda: "Disabled")
+    monkeypatch.setattr(vram, "_read_device_memory", lambda: (4096, 23034, "NVIDIA L4"))
+
+    sampler = vram.VramSampler(interval=0.01)
+    sampler.start()
+    time.sleep(0.1)
+    rendered = sampler.stop().render()
+    assert "MIG=" not in rendered
+
+
+def test_mig_mode_tolerates_a_driver_without_the_field(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An unsupported query field fails the whole call; that is not an error."""
+    fake = subprocess.CompletedProcess(args=vram._MIG_QUERY, returncode=1, stdout="", stderr="Field not supported")
+    monkeypatch.setattr(vram.subprocess, "run", lambda *a, **k: fake)
+    assert vram.mig_mode() == ""
+
+
+def test_mig_mode_tolerates_a_missing_binary(monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom(*_a, **_k):
+        raise FileNotFoundError("nvidia-smi")
+
+    monkeypatch.setattr(vram.subprocess, "run", boom)
+    assert vram.mig_mode() == ""
