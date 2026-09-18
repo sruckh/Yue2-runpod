@@ -30,6 +30,32 @@ numpy==2.2.6
 soundfile==0.13.1
 accelerate==1.13.0
 
+# --- SheetSage2's non-torch requirements, for the unification probe ---------
+#
+# Derived from SheetSage2's own `requirements.txt` and `requirements-render.txt`
+# (read from m-a-p/SheetSage2, not guessed), minus what is already pinned above
+# and minus what the probe does not need.
+#
+# `mir_eval` and `pretty_midi` are **module-scope** imports in
+# `midi_sheetsage2.py`:
+#
+#     import mir_eval.chord
+#     import numpy as np
+#     import pretty_midi
+#
+# so they are required to import the model at all, not merely to render.
+#
+# `playwright` (from requirements-render.txt) is deliberately absent. It is a
+# browser automation library needing a Chromium download, and
+# `rendering_sheetsage2.py` imports it *inside* a function, not at module scope.
+# The authors made rendering optional on purpose and the image stays that way.
+mir_eval==0.8.2
+# `pretty_midi` declares no dependencies at all — no numpy, no mido — even though
+# it uses both. That is why `mido` is pinned explicitly rather than left to the
+# resolver to notice.
+pretty_midi==0.2.10
+mido==1.3.3
+
 # Worker transport and egress. Not pinned by the model wheel — these are ours.
 runpod==1.12.0
 boto3==1.43.97

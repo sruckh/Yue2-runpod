@@ -85,13 +85,37 @@ def probe_module():
 
 
 def test_every_return_in_probe_sheetsage2_is_a_probe_outcome() -> None:
-    """Statically: every `return` in the body must construct a ProbeOutcome.
+    """Statically: no `return` in the body may hand back something else.
 
-    This is the check that would have caught it before the build. A tuple and a
-    dataclass are indistinguishable at the call site until something reads an
+    This is the check that would have caught bug 4 before the build. A tuple and
+    a dataclass are indistinguishable at the call site until something reads an
     attribute, so the *shape* of the return statements is what has to be pinned.
+
+    A return is acceptable when it either constructs a `ProbeOutcome` or calls a
+    helper that is itself annotated `-> ProbeOutcome`. The looser form matters:
+    after the rewrite the load lives in `load_sheetsage2`, and a check that
+    demanded the literal constructor would forbid extracting it — pushing the
+    code toward the shape that is easy to test rather than the shape that is
+    right.
     """
     tree = ast.parse(PROBE.read_text(encoding="utf-8"))
+
+    def annotated_outcome_helpers() -> set[str]:
+        # Constructing the dataclass is directly fine; a helper is fine when it
+        # declares the same return type.
+        helpers = {"ProbeOutcome"}
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.FunctionDef)
+                and node.returns is not None
+                and ast.unparse(node.returns) == "ProbeOutcome"
+            ):
+                helpers.add(node.name)
+        return helpers
+
+    helpers = annotated_outcome_helpers()
+    assert "load_sheetsage2" in helpers, "the extracted loader lost its `-> ProbeOutcome` annotation"
+
     function = next(
         node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "probe_sheetsage2"
     )
@@ -101,14 +125,16 @@ def test_every_return_in_probe_sheetsage2_is_a_probe_outcome() -> None:
     for node in returns:
         value = node.value
         assert value is not None, f"line {node.lineno}: a bare `return` — the caller needs an outcome"
-        # `return ProbeOutcome(...)` — a call to the dataclass by name.
-        is_outcome = (
-            isinstance(value, ast.Call) and isinstance(value.func, ast.Name) and value.func.id == "ProbeOutcome"
-        )
-        assert is_outcome, (
-            f"line {node.lineno}: returns {ast.unparse(value)[:70]!r}, not a ProbeOutcome. "
+        assert isinstance(value, ast.Call), (
+            f"line {node.lineno}: returns {ast.unparse(value)[:70]!r}, not a call. "
             "A bare tuple works until the caller reads `.ok`, and then the probe dies "
             "without a verdict — which is what happened in the build."
+        )
+        callee = value.func
+        name = callee.id if isinstance(callee, ast.Name) else getattr(callee, "attr", None)
+        assert name in helpers, (
+            f"line {node.lineno}: returns a call to {name!r}, which is not annotated `-> ProbeOutcome`. "
+            "Anything else can hand back a tuple and kill the verdict at the print."
         )
 
 
@@ -188,6 +214,154 @@ def test_the_probe_runs_to_a_verdict_rather_than_crashing(probe_module, capsys, 
     assert code in (0, 1)
     # And it did not die partway with a traceback.
     assert "AttributeError" not in out
+
+
+# =============================================================================
+# The static scan: report every absent package at once, not the first
+# =============================================================================
+#
+# Runs 1-4 of the probe each discovered exactly ONE absent package and stopped,
+# so every answer cost a full image build — torchaudio, then mir_eval, with the
+# rest of the queue unknown. Importing to discover is what makes that
+# one-at-a-time. `absent_modules` reads the source instead, so a single build
+# reports the complete list.
+
+
+def test_the_scan_reports_all_absent_modules_not_just_the_first(probe_module) -> None:
+    """The property that makes one build sufficient.
+
+    `import` stops at the first failure, so a load-driven check can only ever
+    name one missing package. `find_spec` over a set reports them all.
+    """
+    absent = probe_module.absent_modules(
+        ["definitely_not_a_real_module_aaa", "definitely_not_a_real_module_bbb", "sys"]
+    )
+    assert absent == ["definitely_not_a_real_module_aaa", "definitely_not_a_real_module_bbb"]
+    assert "sys" not in absent, "a stdlib module was reported absent"
+
+
+def test_the_scan_treats_the_repos_own_files_as_local(probe_module, tmp_path: Path) -> None:
+    """`modeling_sheetsage2` is a file in the repo, not a package to install.
+
+    Without this the scan reports every sibling module as a missing dependency,
+    which would be a false failure of exactly the kind this probe keeps making.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "modeling_sheetsage2.py").write_text("import numpy\n", encoding="utf-8")
+    (repo / "infer.py").write_text("from modeling_sheetsage2 import X\n", encoding="utf-8")
+
+    local = probe_module.local_module_names(repo)
+    assert {"modeling_sheetsage2", "infer"} <= local
+    # numpy is real; the siblings must not appear.
+    assert "modeling_sheetsage2" not in probe_module.third_party_imports(repo)
+    assert "infer" not in probe_module.third_party_imports(repo)
+
+
+def test_relative_imports_are_not_mistaken_for_dependencies(probe_module, tmp_path: Path) -> None:
+    """`from .io_sheetsage2 import ...` is internal; `from os import ...` is not.
+
+    `ImportFrom.level` distinguishes them, and getting it wrong would report
+    every sibling module as a package to install.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "__init__.py").write_text("", encoding="utf-8")
+    (repo / "a.py").write_text(
+        "from .b import thing\nfrom . import c\nimport os\nimport numpy as np\n",
+        encoding="utf-8",
+    )
+    (repo / "b.py").write_text("", encoding="utf-8")
+
+    found = probe_module.third_party_imports(repo)
+    assert "numpy" in found
+    assert "b" not in found, "a relative import was reported as a dependency"
+    assert "os" not in found, "a stdlib import was reported as a dependency"
+
+
+def test_the_scan_finds_a_module_scope_import_that_would_break_the_load(probe_module, tmp_path: Path) -> None:
+    """Pins the actual finding: mir_eval is a module-scope import.
+
+    `midi_sheetsage2.py` does `import mir_eval.chord` at module scope, so it is
+    required to import the model at all — not merely to render. The scan has to
+    see it, and it has to be absent from the main environment, or the probe's
+    `missing` verdict was wrong.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "__init__.py").write_text("", encoding="utf-8")
+    (repo / "midi_sheetsage2.py").write_text(
+        "import mir_eval.chord\nimport numpy as np\nimport pretty_midi\n", encoding="utf-8"
+    )
+
+    found = probe_module.third_party_imports(repo)
+    # The submodule import is recorded by its top-level package.
+    assert {"mir_eval", "pretty_midi"} <= found
+    assert "numpy" in found
+
+
+def test_a_missing_dependency_is_reported_with_the_full_list(probe_module, tmp_path: Path, monkeypatch) -> None:
+    """`probe_sheetsage2` reports every absent module, and names them."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "__init__.py").write_text("", encoding="utf-8")
+    (repo / "modeling_sheetsage2.py").write_text(
+        "import absolutely_not_installed_aaa\nimport absolutely_not_installed_bbb\n", encoding="utf-8"
+    )
+    monkeypatch.setitem(sys.modules, "huggingface_hub", types.SimpleNamespace(snapshot_download=lambda *a, **k: repo))
+
+    outcome = probe_module.probe_sheetsage2("synthetic/repo", offline=False)
+
+    assert outcome.ok is False
+    assert outcome.kind == "missing"
+    assert set(outcome.missing) == {"absolutely_not_installed_aaa", "absolutely_not_installed_bbb"}
+    # Both named in the detail, so the log is actionable without a re-run.
+    assert "absolutely_not_installed_aaa" in outcome.detail
+    assert "absolutely_not_installed_bbb" in outcome.detail
+
+
+def test_the_scan_runs_before_the_load(probe_module, tmp_path: Path, monkeypatch) -> None:
+    """Order matters: a missing package must be reported as a list, not a crash.
+
+    If the load ran first it would raise on whichever import failed first, and
+    the scan's whole value — the complete list — would be lost.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "__init__.py").write_text("", encoding="utf-8")
+    (repo / "modeling_sheetsage2.py").write_text("import absolutely_not_installed_aaa\n", encoding="utf-8")
+    monkeypatch.setitem(sys.modules, "huggingface_hub", types.SimpleNamespace(snapshot_download=lambda *a, **k: repo))
+
+    called = []
+    monkeypatch.setattr(
+        probe_module,
+        "load_sheetsage2",
+        lambda root: called.append(root) or probe_module.ProbeOutcome(True, "ok", "should not run"),
+    )
+
+    outcome = probe_module.probe_sheetsage2("synthetic/repo", offline=False)
+    assert outcome.kind == "missing"
+    assert not called, "the load ran despite an absent dependency — the scan must come first"
+
+
+def test_the_sheetsage_dependencies_are_pinned_in_the_main_environment() -> None:
+    """The packages the probe reports as missing must be declared.
+
+    `mir_eval` and `pretty_midi` are module-scope imports in `midi_sheetsage2.py`;
+    `mido` is pinned because `pretty_midi` declares no dependencies at all.
+    `playwright` must NOT be here: it needs a Chromium download and
+    `rendering_sheetsage2` imports it inside a function, not at module scope.
+    """
+    pins = dict(check_env.parse_requirements(REPO_ROOT / "worker" / "requirements.txt"))
+    for package in ("mir_eval", "pretty_midi", "mido"):
+        assert package in pins, f"{package} is imported by SheetSage2's code but not declared"
+    assert "playwright" not in pins, (
+        "playwright is a render-only dependency, imported lazily; it would pull a Chromium download into the image"
+    )
+    # scipy arrives transitively via mir_eval and is deliberately left to the
+    # resolver — pinning a scipy whose numpy ceiling is below our numpy would
+    # create the very conflict this probe exists to rule out.
+    assert "scipy" not in pins, "scipy is pinned, which risks a numpy ceiling conflict"
 
 
 # =============================================================================
@@ -302,13 +476,14 @@ def test_the_probe_does_not_fetch_weights() -> None:
     should not be trying in the first place.
     """
     source = PROBE.read_text(encoding="utf-8")
-    assert "allow_patterns" in source, "the probe downloads without a pattern filter"
-    match = re.search(r"allow_patterns=\[(.*?)\]", source, re.S)
-    assert match, "could not read the allow_patterns list"
+    match = re.search(r"ALLOW_PATTERNS\s*=\s*\[(.*?)\]", source, re.S)
+    assert match, "could not read the ALLOW_PATTERNS list"
     patterns = match.group(1)
     assert "*.py" in patterns
     assert "*.safetensors" not in patterns
     assert "*.bin" not in patterns
+    # And the constant is the one actually passed to the download.
+    assert "allow_patterns=ALLOW_PATTERNS" in source, "the download does not use ALLOW_PATTERNS"
 
 
 # =============================================================================
@@ -472,7 +647,19 @@ def test_the_probe_is_valid_python_and_imports_are_static() -> None:
         elif isinstance(node, ast.ImportFrom) and node.module:
             imported.add(node.module.split(".")[0])
 
-    stdlib = {"__future__", "argparse", "json", "sys", "traceback", "pathlib", "importlib", "dataclasses", "metadata"}
+    stdlib = {
+        "__future__",
+        "argparse",
+        "ast",
+        "collections",
+        "dataclasses",
+        "importlib",
+        "json",
+        "metadata",
+        "pathlib",
+        "sys",
+        "traceback",
+    }
     third_party = {"huggingface_hub", "transformers"}
     unexpected = imported - stdlib - third_party
     assert not unexpected, f"unexpected imports: {sorted(unexpected)}"

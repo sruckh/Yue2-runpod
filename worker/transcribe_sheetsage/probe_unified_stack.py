@@ -8,21 +8,33 @@ construct under torch 2.10.0 + transformers 4.57.6 + numpy 2.x, rather than the
 
 Why this is worth asking
 ------------------------
-Reading the packages, none of them actually require the others' versions:
+The packages do not appear to require each other's versions:
 
-- torch 2.10.0 declares **no numpy constraint at all**
 - transformers 4.45.2 declares **no torch constraint** (torch is an optional extra)
 - SheetSage2's `config.json` records `"transformers_version": "4.45.2"` — a note
   about what it was tested with, not a requirement
-- its `requirements.txt` numpy floor is `>=1.17`, satisfied by both 1.24.3 and 2.2.6
-- its code contains **no numpy calls at all**, so the numpy-2 alias removals
-  cannot affect it
+- **Correction (2026-09-18):** an earlier version of this docstring claimed
+  SheetSage2 "contains no numpy calls at all, so the numpy-2 alias removals
+  cannot affect it". That is **false**. `midi_sheetsage2.py` calls
+  `np.flatnonzero`, and numpy usage across the repo's ~25 modules has not been
+  audited. The claim was load-bearing reasoning for calling unification
+  low-risk, and it was never checked. Treat the numpy question as open.
+- torch's own numpy constraint is likewise recorded elsewhere and not re-verified
+  here.
 
-The one genuine risk is structural: SheetSage2 imports
+The genuine structural risk is that SheetSage2 imports
 `transformers.models.bart.modeling_bart.BartDecoder` — an internal path that can
 move between transformers releases. Verified present in 4.57.6, but "the symbol
 exists" and "the model constructs" are different claims, and only the second one
 matters.
+
+Why the scan is static
+----------------------
+The first four runs of this probe each discovered **one** absent package and
+stopped, so each answer cost a full image build: torchaudio, then mir_eval, and
+the queue behind them unknown. Importing to find out is what makes that
+one-at-a-time; `absent_modules` reads the downloaded source with `ast` and
+reports every absent dependency in a single pass instead.
 
 What this does and does not prove
 ---------------------------------
@@ -43,9 +55,13 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import ast
+import importlib
+import importlib.util
 import json
 import sys
 import traceback
+from collections.abc import Iterable
 from dataclasses import dataclass
 from importlib import metadata
 from pathlib import Path
@@ -70,6 +86,10 @@ PROBES = (
     ("safetensors", None, "safetensors"),
 )
 
+#: The source files only — never the multi-GB checkpoints. The image's weight
+#: guard would catch a checkpoint landing, but the probe should not try.
+ALLOW_PATTERNS = ["*.py", "config.json", "processor_config.json"]
+
 
 def versions() -> dict[str, str]:
     out = {}
@@ -89,8 +109,6 @@ def probe_imports() -> list[tuple[str, bool, str]]:
     defined in it. SheetSage2 imports the class, so the class is what has to
     survive a transformers upgrade.
     """
-    import importlib
-
     results = []
     for module, attribute, label in PROBES:
         try:
@@ -104,6 +122,71 @@ def probe_imports() -> list[tuple[str, bool, str]]:
     return results
 
 
+# =============================================================================
+# What the downloaded source needs, read statically
+# =============================================================================
+
+
+def local_module_names(root: Path) -> set[str]:
+    """Names belonging to the downloaded repo rather than to a dependency.
+
+    The repo is a flat package: `modeling_sheetsage2.py` and its siblings sit in
+    the root and import each other *relatively*, so those never appear. A
+    top-level `import infer` would otherwise be reported as an absent dependency.
+    """
+    names: set[str] = set()
+    for path in root.rglob("*.py"):
+        names.add(path.stem)
+        relative = path.relative_to(root)
+        if len(relative.parts) > 1:
+            names.add(relative.parts[0])
+    return names
+
+
+def third_party_imports(root: Path) -> set[str]:
+    """Every top-level module the source imports, minus stdlib and its own files.
+
+    Static by design. Importing to discover this stops at the first failure, so
+    the caller learns one absent package per attempt — and each attempt is a
+    build. Reading the source with `ast` answers it completely in one pass.
+    """
+    local = local_module_names(root)
+    found: set[str] = set()
+    for path in sorted(root.rglob("*.py")):
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+        except SyntaxError:
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                found.update(alias.name.split(".")[0] for alias in node.names)
+            # level > 0 is relative: part of this repo, not a dependency.
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                found.add(node.module.split(".")[0])
+    return {name for name in found if name not in sys.stdlib_module_names and name not in local}
+
+
+def absent_modules(modules: Iterable[str]) -> list[str]:
+    """Which of these are not installed.
+
+    `find_spec` rather than an import: importing has side effects and would stop
+    at the first failure. This reports all of them, sorted.
+
+    Only *absence* is detected. A package that is installed but unimportable
+    returns a spec here and is caught later, by the load attempt.
+    """
+    absent: list[str] = []
+    for name in sorted(modules):
+        try:
+            spec = importlib.util.find_spec(name)
+        except (ImportError, ValueError):
+            # A parent package that is itself absent or broken.
+            spec = None
+        if spec is None:
+            absent.append(name)
+    return absent
+
+
 @dataclass
 class ProbeOutcome:
     """Whether SheetSage2's code loaded, and — when it did not — *why not*.
@@ -111,74 +194,50 @@ class ProbeOutcome:
     The distinction is the point. A missing package and a version
     incompatibility both print as failure, but only the second one answers the
     question this probe asks. Reporting "cannot unify" for an absent import
-    overstates the evidence, which is what the first real run did.
+    overstates the evidence, which is what an earlier run did.
     """
 
     ok: bool
     #: `ok` | `missing` | `structural` | `fetch`
     kind: str
     detail: str
+    #: Every absent dependency, when `kind` is `missing`. All of them, not the
+    #: first — that list is the whole reason the scan is static.
+    missing: tuple[str, ...] = ()
 
 
-def probe_sheetsage2(repo_id: str, offline: bool) -> ProbeOutcome:
-    """Download SheetSage2's *code* and import it, without loading weights.
+def load_sheetsage2(root: Path) -> ProbeOutcome:
+    """Load SheetSage2's package and modules from an already-downloaded tree.
 
-    `AutoConfig` pulls `configuration_sheetsage2.py` and its imports; the model
-    class is imported directly to exercise `modeling_sheetsage2.py`. Neither
-    needs the safetensors, so this stays a few-hundred-KB operation rather than
-    a multi-GB one.
+    The repo is a **package**, not a set of loose modules: its files use relative
+    imports (`from .modeling_mert2 import MERT2Model`). A bare
+    `import modeling_sheetsage2` after inserting the directory on `sys.path`
+    cannot work — it has no package context, and the first version of this probe
+    did exactly that. Loading it under a synthetic name gives the relative
+    imports a parent, which is what `trust_remote_code` does internally too.
     """
-    try:
-        from huggingface_hub import snapshot_download
-    except ImportError as exc:
-        return ProbeOutcome(False, "missing", f"huggingface_hub unavailable: {exc}")
-
-    try:
-        # Only the Python source and the config — no weights, no assets.
-        path = snapshot_download(
-            repo_id,
-            allow_patterns=["*.py", "config.json", "processor_config.json"],
-            local_files_only=offline,
-        )
-    except Exception as exc:
-        return ProbeOutcome(False, "fetch", f"could not fetch SheetSage2 code: {type(exc).__name__}: {exc}")
-
-    # The repo is a **package**, not a set of loose modules: its files use
-    # relative imports (`from .modeling_mert2 import MERT2Model`). A bare
-    # `import modeling_sheetsage2` after inserting the directory on `sys.path`
-    # cannot work — it has no package context. The first version of this probe
-    # did exactly that and would have reported "not viable" for a reason that
-    # has nothing to do with the dependency stack.
-    #
-    # Loading it as a package under a synthetic name gives the relative imports
-    # a parent, which is what `trust_remote_code` does internally too.
-    import importlib
-    import importlib.util
-
     package_name = "sheetsage2_probe"
     try:
         from transformers import AutoConfig
 
-        config = AutoConfig.from_pretrained(str(path), trust_remote_code=True)
+        config = AutoConfig.from_pretrained(str(root), trust_remote_code=True)
         kind = type(config).__name__
 
-        # Now the package, so its relative imports resolve. Constructing the
-        # model needs weights; importing the module does not, and the import is
-        # what exercises the transformers internals.
+        # Constructing the model needs weights; importing the module does not,
+        # and the import is what exercises the transformers internals.
         spec = importlib.util.spec_from_file_location(
             package_name,
-            Path(path) / "__init__.py",
-            submodule_search_locations=[str(path)],
+            root / "__init__.py",
+            submodule_search_locations=[str(root)],
         )
         if spec is None or spec.loader is None:
-            return ProbeOutcome(False, "structural", f"could not build a package spec from {path}")
+            return ProbeOutcome(False, "structural", f"could not build a package spec from {root}")
         package = importlib.util.module_from_spec(spec)
         sys.modules[package_name] = package
         spec.loader.exec_module(package)
 
         model_module = importlib.import_module(f"{package_name}.modeling_sheetsage2")
-        model_class = getattr(model_module, "SheetSage2Model", None)
-        if model_class is None:
+        if getattr(model_module, "SheetSage2Model", None) is None:
             return ProbeOutcome(False, "structural", "modeling_sheetsage2 imported but exposes no SheetSage2Model")
 
         # The tokenizer is a second code path with its own imports.
@@ -194,19 +253,51 @@ def probe_sheetsage2(repo_id: str, offline: bool) -> ProbeOutcome:
     except ModuleNotFoundError as exc:
         # A distribution that is not installed, not a version that conflicts.
         # The two print identically and mean opposite things, which is the
-        # distinction this class exists for: the third real run of this probe
+        # distinction this class exists for: the third run of this probe
         # reported `ModuleNotFoundError: No module named 'torchaudio'` as a
-        # verdict, and torchaudio simply was not installed in that environment.
+        # verdict, and torchaudio simply was not installed.
         #
-        # Residual risk: a submodule that moved *inside* an installed
-        # distribution also raises ModuleNotFoundError, and would be called
-        # "missing" here. `probe_imports` checks those paths separately and the
-        # verdict is the conjunction of the two, so a moved internal surfaces as
-        # INCONCLUSIVE rather than as a false "do not unify". The detail line
-        # carries the missing name so a reader can tell which it was.
-        return ProbeOutcome(False, "missing", f"{type(exc).__name__}: {exc}")
+        # The static scan above should have caught this first. If it did not,
+        # the import is of something the scan cannot see — a name built at
+        # runtime, or a module inside a distribution that moved.
+        return ProbeOutcome(False, "missing", f"{type(exc).__name__}: {exc}", (str(exc.name) if exc.name else "",))
     except BaseException as exc:
         return ProbeOutcome(False, "structural", f"{type(exc).__name__}: {exc}\n{traceback.format_exc(limit=4)}")
+
+
+def probe_sheetsage2(repo_id: str, offline: bool) -> ProbeOutcome:
+    """Fetch SheetSage2's code, check what it needs, then try to load it.
+
+    Three stages, in this order for a reason. The scan runs before the load so
+    that a missing dependency is reported as a *complete list* rather than as
+    whichever import happened to fail first.
+    """
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError as exc:
+        return ProbeOutcome(False, "missing", f"huggingface_hub unavailable: {exc}")
+
+    try:
+        path = snapshot_download(repo_id, allow_patterns=ALLOW_PATTERNS, local_files_only=offline)
+    except Exception as exc:
+        return ProbeOutcome(False, "fetch", f"could not fetch SheetSage2 code: {type(exc).__name__}: {exc}")
+
+    root = Path(path)
+    try:
+        required = third_party_imports(root)
+    except OSError as exc:
+        return ProbeOutcome(False, "structural", f"could not scan {root}: {type(exc).__name__}: {exc}")
+
+    absent = absent_modules(required)
+    if absent:
+        return ProbeOutcome(
+            False,
+            "missing",
+            f"{len(absent)} of the {len(required)} modules SheetSage2 imports are not installed: {', '.join(absent)}",
+            tuple(absent),
+        )
+
+    return load_sheetsage2(root)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -227,6 +318,10 @@ def main(argv: list[str] | None = None) -> int:
     print(f"\n=== {args.repo} code under this stack ===")
     outcome = probe_sheetsage2(args.repo, args.offline)
     print(f"  {'ok  ' if outcome.ok else 'FAIL'}  [{outcome.kind}] {outcome.detail}")
+    if outcome.missing:
+        print("\n  SheetSage2's code imports these and they are not installed here:")
+        for name in outcome.missing:
+            print(f"    - {name}")
 
     imports_ok = all(o for _, o, _ in imports)
     verdict = outcome.ok and imports_ok
@@ -253,6 +348,7 @@ def main(argv: list[str] | None = None) -> int:
                     "ok": outcome.ok,
                     "kind": outcome.kind,
                     "detail": outcome.detail.splitlines()[0] if outcome.detail else "",
+                    "missing": list(outcome.missing),
                 },
                 "versions": versions(),
             }
