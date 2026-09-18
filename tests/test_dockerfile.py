@@ -23,6 +23,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import check_env
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -308,3 +309,74 @@ def test_env_variables_are_asserted_not_assumed(dockerfile: str) -> None:
             f"a comment sits inside the ENV continuation: {line!r}. Docker's handling "
             "of that is exactly what this check exists because we could not confirm."
         )
+
+
+# =============================================================================
+# Every environment's torch is pinned
+# =============================================================================
+#
+# The image carries three torch installations, and until now only two were
+# pinned:
+#
+#   main       torch==2.10.0   pinned
+#   sheetsage2 torch==2.8.0    pinned
+#   qwen3-asr  torch 2.14.0    resolved by pip — `qwen-asr` pins transformers
+#                              exactly but leaves torch to `accelerate`'s
+#                              `torch>=2.0.0`, so the newest wins
+#
+# The resolved version was not wrong: that environment transcribed lyrics from a
+# 197 s cover in 78.37 s. What was wrong is that it was *unspecified*, so the
+# image's contents depended on the day it was built, and nothing would have
+# reported a change.
+
+ASR_REQUIREMENTS = REPO_ROOT / "worker" / "transcribe_asr" / "requirements.txt"
+
+
+def test_the_asr_environment_declares_its_torch() -> None:
+    """The one unpinned torch must be pinned, to the version proven on hardware."""
+    assert ASR_REQUIREMENTS.is_file(), (
+        "no requirements file for the Qwen3-ASR environment, so its torch is "
+        "resolved by the dependency tree rather than chosen"
+    )
+    pins = dict(check_env.parse_requirements(ASR_REQUIREMENTS))
+    assert "torch" in pins, "the Qwen3-ASR environment does not pin torch"
+    assert pins["torch"] == "2.14.0", (
+        f"the ASR torch pin is {pins['torch']!r}. 2.14.0 is the version that "
+        "transcribed a real cover; change it only with a hardware test behind it."
+    )
+
+
+def test_every_torch_in_the_image_is_pinned_to_something() -> None:
+    """All three environments, checked together so a fourth cannot slip in bare.
+
+    A venv built from a bare `pip install <pkg>` inherits whatever the tree
+    happens to resolve. That is a reproducibility hole regardless of whether the
+    resolved version works.
+    """
+    files = {
+        "main": REPO_ROOT / "worker" / "requirements.txt",
+        "sheetsage2": REPO_ROOT / "worker" / "transcribe_sheetsage" / "requirements.txt",
+        "qwen3-asr": ASR_REQUIREMENTS,
+    }
+    for name, path in files.items():
+        pins = dict(check_env.parse_requirements(path))
+        assert "torch" in pins, f"{name} does not pin torch"
+
+
+def test_the_asr_requirements_are_installed_before_qwen_asr(dockerfile: str) -> None:
+    """Order matters: a satisfied pin stops pip re-picking torch.
+
+    Same reasoning as the sheetsage2 environment. Installing `qwen-asr` first
+    would let its tree choose torch, and the pin would then be a wish rather than
+    a constraint.
+    """
+    pinned_at = dockerfile.index("pip install --no-cache-dir -r /tmp/asr-requirements.txt")
+    qwen_at = dockerfile.index('pip install --no-cache-dir "qwen-asr==0.0.6"')
+    assert pinned_at < qwen_at, "qwen-asr is installed before the torch pin"
+
+
+def test_the_asr_environment_is_asserted_at_build_time(dockerfile: str) -> None:
+    """A pin that is never checked is a comment."""
+    assert "check_env.py --requirements /tmp/asr-requirements.txt" in dockerfile, (
+        "the Qwen3-ASR environment is installed but its pins are never verified"
+    )

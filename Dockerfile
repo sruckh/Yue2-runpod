@@ -180,9 +180,22 @@ RUN python -m venv /opt/venvs/sheetsage2 \
 
 # Qwen3-ASR: the transformers backend, not vLLM. There is no concurrency need at
 # one-job-at-a-time, and the `vllm` extra would pull a second torch.
+#
+# `qwen-asr` pins transformers exactly but leaves torch to `accelerate`'s
+# `torch>=2.0.0`, so pip takes the newest available — 2.14.0 at the last build.
+# That version did real work (a 197 s cover, lyrics in 78.37 s), so it is pinned
+# here rather than left to the resolver: an image whose contents depend on the
+# day it was built is not reproducible, and nothing would report the drift.
+#
+# Installed in the same order as sheetsage2 and for the same reason — the pin is
+# satisfied first, so pip skips torch when it resolves qwen-asr's tree instead of
+# re-picking it. See worker/transcribe_asr/requirements.txt.
+COPY worker/transcribe_asr/requirements.txt /tmp/asr-requirements.txt
 RUN python -m venv /opt/venvs/qwen3-asr \
     && /opt/venvs/qwen3-asr/bin/python -m pip install --no-cache-dir --upgrade pip \
-    && /opt/venvs/qwen3-asr/bin/python -m pip install --no-cache-dir "qwen-asr==0.0.6"
+    && /opt/venvs/qwen3-asr/bin/python -m pip install --no-cache-dir -r /tmp/asr-requirements.txt \
+    && /opt/venvs/qwen3-asr/bin/python -m pip install --no-cache-dir "qwen-asr==0.0.6" \
+    && rm -f /tmp/asr-requirements.txt
 
 # --- verify all three environments -------------------------------------------------
 #
@@ -210,7 +223,11 @@ RUN /opt/venvs/sheetsage2/bin/python /tmp/check_env.py --requirements /tmp/sheet
 # The Qwen3-ASR environment. It declares no torch pin, so there is nothing to
 # assert about which torch it resolved — the checker reports it. What *is*
 # asserted is that the package imports, which is the part a pin can speak to.
+# Now that torch is pinned here, the checker can assert it instead of reporting
+# it. The import check stays: a pin says nothing about whether the wheel loads.
 RUN /opt/venvs/qwen3-asr/bin/python -c "import qwen_asr" && echo "qwen3-asr: qwen_asr imports"
+COPY worker/transcribe_asr/requirements.txt /tmp/asr-requirements.txt
+RUN /opt/venvs/qwen3-asr/bin/python /tmp/check_env.py --requirements /tmp/asr-requirements.txt
 
 # A single summary of all three environments, so the build log states plainly
 # what it produced instead of leaving it scattered across three pip transcripts.

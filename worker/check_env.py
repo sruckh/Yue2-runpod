@@ -51,8 +51,16 @@ YUEE2_REQUIREMENTS = Path(__file__).parent / "requirements.txt"
 SHEETSAGE_REQUIREMENTS = Path(__file__).parent / "transcribe_sheetsage" / "requirements.txt"
 
 #: Packages that are *expected* to be absent from some environments, so their
-#: absence is reported but does not fail a check. `qwen-asr` pins no torch at
-#: all, so which torch it resolved cannot be asserted — only reported.
+#: absence is reported but does not fail a check. `qwen-asr` belongs only to the
+#: Qwen3-ASR environment; a check run against the main or SheetSage2 pins would
+#: otherwise fail on a package those environments were never meant to have.
+#:
+#: This entry used to carry a second justification — that `qwen-asr` "pins no
+#: torch at all, so which torch it resolved cannot be asserted". That is no
+#: longer true: torch is pinned for that environment in
+#: `worker/transcribe_asr/requirements.txt`, and the build asserts it. The
+#: advisory flag is about absence, not about torch, and the note is corrected
+#: rather than left to mislead.
 REPORT_ONLY = frozenset({"qwen-asr"})
 
 #: Packages whose import is worth attempting. Deliberately excludes anything

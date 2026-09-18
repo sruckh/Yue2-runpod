@@ -1,0 +1,24 @@
+# Qwen3-ASR environment — cover mode's lyric transcription.
+#
+# This file exists for **one pin**, and the reason is not that the resolved
+# version is wrong. It is that the version was *unspecified*.
+#
+# `qwen-asr==0.0.6` pins `transformers==4.57.6` exactly, but declares torch only
+# through `accelerate==1.12.0`, which asks for `torch>=2.0.0` — no upper bound.
+# pip therefore takes whatever is newest at build time. The last build resolved
+# **torch 2.14.0**, pulled its CUDA 13.0 stack, and that environment then did real
+# work: a 197 s cover transcribed lyrics in 78.37 s and the job completed.
+#
+# So 2.14.0 is proven. What was not proven is that the *next* build would resolve
+# it: an image whose contents depend on the day it was built is not reproducible,
+# and nothing in the build would have reported the difference. Pinning freezes
+# what has been demonstrated on hardware.
+#
+# Installed **before** qwen-asr, matching the sheetsage2 environment. That order
+# matters for the same reason it does there: with this pin already satisfied, pip
+# skips torch when it resolves qwen-asr's tree rather than re-picking it.
+#
+# No `--extra-index-url`: unlike torch 2.10.0, whose plain PyPI wheel is CPU-only,
+# the 2.14.0 wheel on PyPI is the CUDA build (554 MB) and brings `nvidia-*` cu13
+# packages with it. That is exactly what the last build installed.
+torch==2.14.0
