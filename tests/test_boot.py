@@ -13,6 +13,7 @@ caching never actually worked. These tests pin the layout so that cannot recur.
 
 from __future__ import annotations
 
+import shutil
 import sys
 import types
 from pathlib import Path
@@ -23,6 +24,7 @@ from conftest import hub_cache_root, populate_runpod_cache, snapshot_dir
 
 import boot
 from boot import (
+    CACHED_REPOS,
     REQUIRED_MODEL_FILES,
     REQUIRED_VAE_FILES,
     BootError,
@@ -68,9 +70,17 @@ def fake_hf(monkeypatch: pytest.MonkeyPatch) -> SnapshotRecorder:
 
 
 def cached_all(volume: Path) -> None:
-    """Both repos present, as RunPod would leave them."""
-    populate_runpod_cache(volume, MODEL_REPO, (*REQUIRED_MODEL_FILES, MODEL_WHEEL))
-    populate_runpod_cache(volume, VAE_REPO, REQUIRED_VAE_FILES)
+    """Every repo present, as RunPod would leave them.
+
+    Driven by `CACHED_REPOS` rather than a hand-written pair, because the pair
+    is exactly what went stale: the list grew to four and this helper kept
+    populating two, so a "cache hit" test would have passed against a cache the
+    worker no longer considers complete. Deriving it means a repo added to the
+    worker is populated here automatically.
+    """
+    for repo_id, required, _patterns in CACHED_REPOS:
+        files = (*required, MODEL_WHEEL) if repo_id == MODEL_REPO else required
+        populate_runpod_cache(volume, repo_id, files)
 
 
 # =============================================================================
@@ -122,7 +132,9 @@ def test_runpod_cache_hit_downloads_nothing(volume: Path, fake_hf: SnapshotRecor
 
     assert report.cache_hit is True
     assert fake_hf.calls == [], "a populated RunPod cache must not trigger a download"
-    assert set(report.from_cache) == {MODEL_REPO, VAE_REPO}
+    # All four, not the two the create path uses: offline mode is global, so a
+    # repo the cover path needs but this list omits is unreachable, not slow.
+    assert set(report.from_cache) == {repo for repo, _, _ in CACHED_REPOS}
     assert report.downloaded == {}
 
 
@@ -139,12 +151,21 @@ def test_cache_hit_reports_the_snapshot_paths(volume: Path, fake_hf: SnapshotRec
 
 
 def test_missing_model_falls_back_to_download(volume: Path, fake_hf: SnapshotRecorder) -> None:
-    populate_runpod_cache(volume, VAE_REPO, REQUIRED_VAE_FILES)  # VAE cached, model not
+    """Only the absent repo is fetched; the cached ones are left alone.
+
+    The assertion is set-based on purpose. Listing the expected repos by hand is
+    what let this test keep asserting a two-repo scope after the worker grew to
+    four — it was describing the code it was written against, not the contract.
+    """
+    cached_all(volume)
+    # Drop exactly one repo's tree so it is the only miss.
+    shutil.rmtree(volume / "huggingface-cache" / "hub" / f"models--{MODEL_REPO.replace('/', '--')}")
+
     report = ensure_models(CacheConfig())
 
-    assert [c["repo_id"] for c in fake_hf.calls] == [MODEL_REPO]
-    assert report.downloaded == {MODEL_REPO: snapshot_dir(volume, MODEL_REPO, "deadbeef")}
-    assert report.from_cache == {VAE_REPO: snapshot_dir(volume, VAE_REPO)}
+    assert [c["repo_id"] for c in fake_hf.calls] == [MODEL_REPO], "only the absent repo may be fetched"
+    assert set(report.downloaded) == {MODEL_REPO}
+    assert set(report.from_cache) == {repo for repo, _, _ in CACHED_REPOS} - {MODEL_REPO}
 
 
 def test_fallback_uses_cache_dir_not_local_dir(volume: Path, fake_hf: SnapshotRecorder) -> None:
@@ -181,7 +202,7 @@ def test_second_call_after_fallback_needs_no_network(volume: Path, fake_hf: Snap
 
 def test_fallback_downloads_both_when_volume_is_cold(volume: Path, fake_hf: SnapshotRecorder) -> None:
     report = ensure_models(CacheConfig())
-    assert set(report.downloaded) == {MODEL_REPO, VAE_REPO}
+    assert set(report.downloaded) == {repo for repo, _, _ in CACHED_REPOS}
     assert report.from_cache == {}
 
 
@@ -364,3 +385,93 @@ def test_load_pipeline_reports_missing_wheel_module(volume: Path, monkeypatch: p
     monkeypatch.setitem(sys.modules, "yue2", None)
     with pytest.raises(BootError, match="yue2_infer is not installed"):
         boot.load_pipeline(None, cache=CacheConfig())
+
+
+# =============================================================================
+# The cache list must cover every repo the worker can need
+# =============================================================================
+#
+# The bug these exist for, found by the first real cover job (2026-09-18):
+#
+#     cover mode: melody transcription failed — We couldn't connect to
+#     'https://huggingface.co' ... and it looks like m-a-p/SheetSage2 is not the
+#     path to a directory containing a file named config.json
+#
+# `ensure_models` cached only YuE2's two repos, then called
+# `cache.enable_offline_mode()` — which sets `HF_HUB_OFFLINE` and
+# `TRANSFORMERS_OFFLINE` **globally**, and `subprocess_runner._INHERITED_ENV`
+# passes both to the cover children. So SheetSage2 was not merely uncached, it
+# was unreachable: the subprocess had been told not to use the network.
+#
+# The failure reads as a network fault and is really a scope error in this list,
+# which is why it is pinned structurally rather than by checking one repo.
+
+
+def test_every_repo_the_cover_children_default_to_is_cached() -> None:
+    """The ids the subprocesses actually request must all be in `CACHED_REPOS`.
+
+    Read from the child entrypoints rather than hardcoded here, so renaming a
+    model in `transcribe_sheetsage/run.py` without caching it fails this test
+    instead of failing a GPU job five minutes in.
+    """
+    import ast
+
+    worker = Path(__file__).resolve().parent.parent / "worker"
+    cached = {repo for repo, _, _ in CACHED_REPOS}
+
+    child_defaults: dict[str, str] = {}
+    for entrypoint in ("transcribe_sheetsage/run.py", "transcribe_asr/run.py"):
+        tree = ast.parse((worker / entrypoint).read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign) and any(getattr(t, "id", None) == "DEFAULT_MODEL" for t in node.targets):
+                child_defaults[entrypoint] = ast.literal_eval(node.value)
+
+    assert child_defaults, "no DEFAULT_MODEL found — did the entrypoints get renamed?"
+    for entrypoint, repo_id in child_defaults.items():
+        assert repo_id in cached, (
+            f"{entrypoint} defaults to {repo_id!r}, which is not in CACHED_REPOS. "
+            "Offline mode is enabled after the cache is verified and is inherited by "
+            "this subprocess, so an uncached repo is unreachable, not merely slow."
+        )
+
+
+def test_offline_mode_is_what_makes_an_uncached_repo_unreachable() -> None:
+    """Pins the causal link, so the reasoning above is not just a story.
+
+    If offline mode ever stops being global or stops being inherited, this test
+    fails and the constraint on `CACHED_REPOS` can be reconsidered. Until then
+    it is load-bearing.
+    """
+    from subprocess_runner import _INHERITED_ENV
+
+    assert "HF_HUB_OFFLINE" in _INHERITED_ENV
+    assert "TRANSFORMERS_OFFLINE" in _INHERITED_ENV
+
+
+def test_offline_mode_is_enabled_only_after_every_repo_is_verified() -> None:
+    """Offline before the check would make the fallback download impossible.
+
+    `enable_offline_mode` must run *after* the loop, or the network-volume
+    fallback — the whole point of the second half of `ensure_models` — could
+    never fetch anything.
+    """
+    import inspect
+
+    source = inspect.getsource(ensure_models)
+    loop_at = source.index("for repo_id, required, patterns in CACHED_REPOS")
+    offline_at = source.index("cache.enable_offline_mode()")
+    assert loop_at < offline_at, "offline mode is enabled before the cache is verified"
+
+
+def test_the_cover_repos_are_required_not_merely_downloaded() -> None:
+    """A repo listed but with an empty `required` tuple would never be checked.
+
+    `ensure_models` treats a repo as present when it resolves *and* holds every
+    required file. An empty tuple makes "present" mean "a directory exists",
+    which is how a truncated download would slip through.
+    """
+    for repo_id, required, patterns in CACHED_REPOS:
+        assert required, f"{repo_id} has no required files, so its presence is never verified"
+        assert "config.json" in required, f"{repo_id} does not require config.json"
+        for name in required:
+            assert name in patterns, f"{repo_id}: {name!r} is required but not downloaded"

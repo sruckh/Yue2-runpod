@@ -24,8 +24,20 @@ WORKER_DIR = Path(__file__).resolve().parent
 # --- Model identifiers -------------------------------------------------------
 # Weights are never baked into the image (locked decision 4). These are the
 # repos `boot.ensure_models()` caches onto the network volume.
+#
+# **All four, not just the two the create path uses.** `ensure_models` enables
+# HuggingFace offline mode once it has verified the cache, and that switch is
+# global — it is inherited by the cover/edit subprocesses through
+# `subprocess_runner._INHERITED_ENV`. Enabling it after verifying only YuE2's
+# repos meant a `cover` job reached SheetSage2 offline, uncached, and failed with
+# transformers' "we couldn't connect and it isn't in the cache" — which reads as
+# a network fault and is really a scope error in this list.
 MODEL_REPO = "m-a-p/YuE2-3B"
 VAE_REPO = "m-a-p/YuE2-Vae"
+#: Melody transcription for `cover`/`edit` (MERT-v2 encoder + SheetSage2 adapter).
+SHEETSAGE_REPO = "m-a-p/SheetSage2"
+#: Lyrics transcription for `cover`, from the recording's vocals.
+ASR_REPO = "Qwen/Qwen3-ASR-1.7B"
 MODEL_WHEEL = "yue2_infer-0.1.5-py3-none-any.whl"
 
 # Model-family defaults mirrored from the pipeline's own protocol.SongRequest,

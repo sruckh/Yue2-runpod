@@ -33,7 +33,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from config import MODEL_REPO, MODEL_WHEEL, VAE_REPO, CacheConfig
+from config import ASR_REPO, MODEL_REPO, MODEL_WHEEL, SHEETSAGE_REPO, VAE_REPO, CacheConfig
 
 log = logging.getLogger(__name__)
 
@@ -88,6 +88,48 @@ VAE_FILE_PATTERNS = (
     "LICENSE",
     "THIRD_PARTY_NOTICES.md",
     "licenses/*",
+)
+
+# --- Cover/edit transcription models -----------------------------------------
+#
+# Cached for the same reason YuE2 is: `ensure_models` enables HF offline mode
+# once it has verified the cache, and that switch is inherited by the cover
+# subprocesses via `subprocess_runner._INHERITED_ENV`. A repo the cover path
+# needs but this list omits is therefore **unreachable**, not merely slow — the
+# child cannot fall back to the network because we told it not to.
+#
+# That is not hypothetical: it is what made the first real cover job fail in
+# 5.06 s with "We couldn't connect to 'https://huggingface.co' ... and it looks
+# like m-a-p/SheetSage2 is not the path to a directory containing a file named
+# config.json", which reads as a network fault and is really a scope error here.
+REQUIRED_SHEETSAGE_FILES = (
+    "config.json",
+    "model.safetensors",
+)
+SHEETSAGE_FILE_PATTERNS = (
+    *REQUIRED_SHEETSAGE_FILES,
+    "model.safetensors.index.json",
+    "LICENSE",
+)
+REQUIRED_ASR_FILES = (
+    "config.json",
+    "model.safetensors",
+)
+ASR_FILE_PATTERNS = (
+    *REQUIRED_ASR_FILES,
+    "model.safetensors.index.json",
+    "generation_config.json",
+    "LICENSE",
+)
+
+#: `(repo_id, required files, download patterns)` for every repo the worker can
+#: need. `ensure_models` iterates this, and tests assert the cover path's repos
+#: are covered — a repo absent from here is one offline mode makes unreachable.
+CACHED_REPOS = (
+    (MODEL_REPO, REQUIRED_MODEL_FILES, MODEL_FILE_PATTERNS),
+    (VAE_REPO, REQUIRED_VAE_FILES, VAE_FILE_PATTERNS),
+    (SHEETSAGE_REPO, REQUIRED_SHEETSAGE_FILES, SHEETSAGE_FILE_PATTERNS),
+    (ASR_REPO, REQUIRED_ASR_FILES, ASR_FILE_PATTERNS),
 )
 
 
@@ -234,10 +276,7 @@ def ensure_models(cache: CacheConfig | None = None) -> ModelCacheReport:
     started = time.perf_counter()
     report = ModelCacheReport()
 
-    for repo_id, required, patterns in (
-        (MODEL_REPO, REQUIRED_MODEL_FILES, MODEL_FILE_PATTERNS),
-        (VAE_REPO, REQUIRED_VAE_FILES, VAE_FILE_PATTERNS),
-    ):
+    for repo_id, required, patterns in CACHED_REPOS:
         found = resolve_cached_snapshot(repo_id, cache)
         if found is not None and not _missing_files(found, required):
             log.info("%s resolved from cache at %s", repo_id, found)
