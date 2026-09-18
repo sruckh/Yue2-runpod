@@ -157,9 +157,9 @@ MERT_FILE_PATTERNS = (
 #: `model-0000*-of-00002.safetensors`, so the weights had not been downloaded at
 #: all and the error was about a file that never existed upstream.
 #:
-#: Weights are therefore checked by `WEIGHTS_ANY` below, not by a spelled-out
+#: Weights are therefore checked by `WEIGHTS_GLOB` below, not by a spelled-out
 #: filename, so a repo may be single-file or sharded without this list caring.
-REQUIRED_ASR_FILES = ("config.json",)
+REQUIRED_ASR_FILES = ("config.json", "model.safetensors.index.json")
 ASR_FILE_PATTERNS = (
     *REQUIRED_ASR_FILES,
     "*.safetensors",  # shards or single file — do not enumerate spellings
@@ -173,22 +173,34 @@ ASR_FILE_PATTERNS = (
     "generation_config.json",
 )
 
-#: A repo's weights, in whatever spelling it ships them. At least one must be
-#: present. Checking a fixed filename instead is what broke the ASR repo.
-WEIGHTS_ANY = ("model.safetensors", "model.safetensors.index.json")
+#: A repo's weights, in whatever spelling it ships them: one file, or many
+#: shards. Matched as a **glob**, not a name.
+#:
+#: It must not be satisfied by `model.safetensors.index.json`. That file is a
+#: *manifest* — a map from tensor names to shard filenames — and an earlier
+#: version of this check accepted it as evidence the weights were present. A
+#: cache holding the index and none of the shards therefore passed verification
+#: and failed much later, inside a GPU job, after 51 s of real work:
+#:
+#:     Qwen/Qwen3-ASR-1.7B does not appear to have files named
+#:     ('model-00001-of-00002.safetensors', 'model-00002-of-00002.safetensors')
+#:
+#: A glob over `*.safetensors` is satisfied only by an actual weight file, which
+#: covers both layouts without naming either.
+WEIGHTS_GLOB = "*.safetensors"
 
 #: `(repo_id, required files, download patterns)` for every repo the worker can
 #: need. `ensure_models` iterates this, and tests assert the cover path's repos
 #: are covered — a repo absent from here is one offline mode makes unreachable.
 CACHED_REPOS = (
-    (MODEL_REPO, REQUIRED_MODEL_FILES, MODEL_FILE_PATTERNS, WEIGHTS_ANY),
-    (VAE_REPO, REQUIRED_VAE_FILES, VAE_FILE_PATTERNS, WEIGHTS_ANY),
-    (SHEETSAGE_REPO, REQUIRED_SHEETSAGE_FILES, SHEETSAGE_FILE_PATTERNS, WEIGHTS_ANY),
+    (MODEL_REPO, REQUIRED_MODEL_FILES, MODEL_FILE_PATTERNS, WEIGHTS_GLOB),
+    (VAE_REPO, REQUIRED_VAE_FILES, VAE_FILE_PATTERNS, WEIGHTS_GLOB),
+    (SHEETSAGE_REPO, REQUIRED_SHEETSAGE_FILES, SHEETSAGE_FILE_PATTERNS, WEIGHTS_GLOB),
     # SheetSage2's encoder parent. `modeling_mert2.py` and its config are
     # required because SheetSage2's integrity check hashes them — and because
     # `trust_remote_code` loads MERT under the *SheetSage2* remote-code path.
-    (MERT_REPO, REQUIRED_MERT_FILES, MERT_FILE_PATTERNS, WEIGHTS_ANY),
-    (ASR_REPO, REQUIRED_ASR_FILES, ASR_FILE_PATTERNS, WEIGHTS_ANY),
+    (MERT_REPO, REQUIRED_MERT_FILES, MERT_FILE_PATTERNS, WEIGHTS_GLOB),
+    (ASR_REPO, REQUIRED_ASR_FILES, ASR_FILE_PATTERNS, WEIGHTS_GLOB),
 )
 
 
@@ -229,17 +241,19 @@ class ModelCacheReport:
         return self.from_cache.get(VAE_REPO) or self.downloaded.get(VAE_REPO)
 
 
-def _missing_files(directory: Path, required: tuple[str, ...], weights_any: tuple[str, ...] = ()) -> list[str]:
-    """Names the directory lacks. `weights_any` is satisfied by any one of them.
+def _missing_files(directory: Path, required: tuple[str, ...], weights_glob: str = "") -> list[str]:
+    """Names the directory lacks. `weights_glob` must match at least one file.
 
-    The second argument exists because a repo may ship `model.safetensors` or N
-    shards plus an index, and requiring one spelling rejects the other. The
-    returned entry for missing weights reads "a or b" so the boot error names
-    the choice rather than a filename that may never have existed.
+    A glob rather than a list of spellings because a repo may ship
+    `model.safetensors` or N shards, and naming either layout rejects the other.
+
+    It must match a real file. An index is not weights — accepting one as proof
+    is what let a shard-less cache pass verification and fail inside a job, 51
+    seconds in, naming shards that had never been downloaded.
     """
     missing = [name for name in required if not (directory / name).is_file()]
-    if weights_any and not any((directory / name).is_file() for name in weights_any):
-        missing.append(" or ".join(weights_any))
+    if weights_glob and not any(directory.glob(weights_glob)):
+        missing.append(weights_glob)
     return missing
 
 
@@ -345,9 +359,9 @@ def ensure_models(cache: CacheConfig | None = None) -> ModelCacheReport:
     started = time.perf_counter()
     report = ModelCacheReport()
 
-    for repo_id, required, patterns, weights_any in CACHED_REPOS:
+    for repo_id, required, patterns, weights_glob in CACHED_REPOS:
         found = resolve_cached_snapshot(repo_id, cache)
-        if found is not None and not _missing_files(found, required, weights_any):
+        if found is not None and not _missing_files(found, required, weights_glob):
             log.info("%s resolved from cache at %s", repo_id, found)
             report.from_cache[repo_id] = found
             continue
@@ -356,7 +370,7 @@ def ensure_models(cache: CacheConfig | None = None) -> ModelCacheReport:
             # Present but incomplete: a partial download, or an upstream layout
             # change. Re-fetch rather than boot on a broken tree.
             log.warning(
-                "%s is cached but missing %s; re-fetching", repo_id, _missing_files(found, required, weights_any)
+                "%s is cached but missing %s; re-fetching", repo_id, _missing_files(found, required, weights_glob)
             )
         else:
             log.info("%s not in the cache; downloading (network-volume fallback)", repo_id)
@@ -368,7 +382,7 @@ def ensure_models(cache: CacheConfig | None = None) -> ModelCacheReport:
                 f"{repo_id} is not in the cache at {cache.hub_cache} after downloading. "
                 + "Check that the endpoint's cached-models configuration and the volume agree."
             )
-        still_missing = _missing_files(found, required, weights_any)
+        still_missing = _missing_files(found, required, weights_glob)
         if still_missing:
             raise BootError(
                 f"{repo_id} is still missing {still_missing} after download. "

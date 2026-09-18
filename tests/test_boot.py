@@ -56,7 +56,10 @@ class SnapshotRecorder:
         spec = next((entry for entry in CACHED_REPOS if entry[0] == repo_id), None)
         files = list(spec[1]) if spec else []
         if spec and spec[3]:
-            files.append(spec[3][0])
+            # spec[3] is a glob like "*.safetensors"; write a real weight file
+            # that satisfies it. Index-slicing a glob would write a file named
+            # "*", which matches nothing.
+            files.append("model.safetensors")
         for filename in files:
             (snap / filename).write_bytes(b"x")
         if repo_id == MODEL_REPO:
@@ -85,12 +88,12 @@ def cached_all(volume: Path) -> None:
     worker no longer considers complete. Deriving it means a repo added to the
     worker is populated here automatically.
     """
-    for repo_id, required, _patterns, weights_any in CACHED_REPOS:
+    for repo_id, required, _patterns, weights_glob in CACHED_REPOS:
         files = list(required)
-        if weights_any:
-            # One spelling is enough: a repo ships either a single file or
-            # shards plus an index, and the check accepts either.
-            files.append(weights_any[0])
+        if weights_glob:
+            # A real weight file. `model.safetensors` satisfies the glob whatever
+            # the repo's real layout is, and — unlike an index — it is weights.
+            files.append("model.safetensors")
         if repo_id == MODEL_REPO:
             files.append(MODEL_WHEEL)
         populate_runpod_cache(volume, repo_id, tuple(files))
@@ -476,7 +479,7 @@ def test_offline_mode_is_enabled_only_after_every_repo_is_verified() -> None:
     import inspect
 
     source = inspect.getsource(ensure_models)
-    loop_at = source.index("for repo_id, required, patterns, weights_any in CACHED_REPOS")
+    loop_at = source.index("for repo_id, required, patterns, weights_glob in CACHED_REPOS")
     offline_at = source.index("cache.enable_offline_mode()")
     assert loop_at < offline_at, "offline mode is enabled before the cache is verified"
 
@@ -488,7 +491,7 @@ def test_the_cover_repos_are_required_not_merely_downloaded() -> None:
     required file. An empty tuple makes "present" mean "a directory exists",
     which is how a truncated download would slip through.
     """
-    for repo_id, required, patterns, _weights in CACHED_REPOS:
+    for repo_id, required, patterns, _glob in CACHED_REPOS:
         assert required, f"{repo_id} has no required files, so its presence is never verified"
         assert "config.json" in required, f"{repo_id} does not require config.json"
         for name in required:
@@ -566,7 +569,7 @@ def test_the_transitive_chain_is_documented_where_a_reader_will_look() -> None:
 def test_weights_check_accepts_a_single_file(tmp_path: Path) -> None:
     (tmp_path / "config.json").write_text("{}", encoding="utf-8")
     (tmp_path / "model.safetensors").write_bytes(b"w")
-    assert boot._missing_files(tmp_path, ("config.json",), boot.WEIGHTS_ANY) == []
+    assert boot._missing_files(tmp_path, ("config.json",), boot.WEIGHTS_GLOB) == []
 
 
 def test_weights_check_accepts_shards_plus_an_index(tmp_path: Path) -> None:
@@ -575,15 +578,15 @@ def test_weights_check_accepts_shards_plus_an_index(tmp_path: Path) -> None:
     (tmp_path / "model-00001-of-00002.safetensors").write_bytes(b"w")
     (tmp_path / "model-00002-of-00002.safetensors").write_bytes(b"w")
     (tmp_path / "model.safetensors.index.json").write_text("{}", encoding="utf-8")
-    assert boot._missing_files(tmp_path, ("config.json",), boot.WEIGHTS_ANY) == []
+    assert boot._missing_files(tmp_path, ("config.json",), boot.WEIGHTS_GLOB) == []
 
 
 def test_weights_check_reports_a_repo_with_no_weights(tmp_path: Path) -> None:
     """A config-only tree must fail, and say what was expected."""
     (tmp_path / "config.json").write_text("{}", encoding="utf-8")
-    missing = boot._missing_files(tmp_path, ("config.json",), boot.WEIGHTS_ANY)
+    missing = boot._missing_files(tmp_path, ("config.json",), boot.WEIGHTS_GLOB)
     assert missing, "a repo with no weights must not pass the presence check"
-    assert "model.safetensors" in missing[0], "the error must name what was expected"
+    assert "safetensors" in missing[0], "the error must name what was expected"
 
 
 #: Repos whose weights ship as multiple shards, verified against the Hub on
@@ -600,7 +603,7 @@ def test_a_sharded_repo_can_actually_download_its_shards() -> None:
     weights are unreachable. The check therefore keys on the *known layout*
     rather than on either spelling being present.
     """
-    for repo_id, _required, patterns, _weights in CACHED_REPOS:
+    for repo_id, _required, patterns, _glob in CACHED_REPOS:
         if repo_id in KNOWN_SHARDED_REPOS:
             assert "*.safetensors" in patterns, (
                 f"{repo_id} ships shards; without a glob its weights cannot be downloaded at all. patterns={patterns}"
@@ -639,8 +642,8 @@ def test_required_files_are_downloadable_and_weights_are_checked_by_layout() -> 
     sharded, and only ASR must therefore avoid the literal. The rule is "required
     names files the repo actually has", not "required avoids weights".
     """
-    for repo_id, required, patterns, weights_any in CACHED_REPOS:
-        assert weights_any, f"{repo_id} has no weights check"
+    for repo_id, required, patterns, weights_glob in CACHED_REPOS:
+        assert weights_glob, f"{repo_id} has no weights check"
         for name in required:
             assert name in patterns, f"{repo_id}: {name!r} is required but never downloaded"
 
@@ -683,7 +686,7 @@ def test_trust_remote_code_repos_download_their_python() -> None:
     `configuration_*.py`, which reads like a cache miss rather than a pattern
     omission.
     """
-    for repo_id, _required, patterns, _weights in CACHED_REPOS:
+    for repo_id, _required, patterns, _glob in CACHED_REPOS:
         if repo_id in TRUST_REMOTE_CODE_REPOS:
             assert "*.py" in patterns, (
                 f"{repo_id} uses trust_remote_code, so its model code must be downloaded. patterns={patterns}"
@@ -697,7 +700,7 @@ def test_trust_remote_code_repos_require_their_code_entry_points() -> None:
     check and then fail at load. Requiring the two entry points makes the check
     fail at *cache* time, where the error names the repo and the file.
     """
-    for repo_id, required, _patterns, _weights in CACHED_REPOS:
+    for repo_id, required, _patterns, _glob in CACHED_REPOS:
         if repo_id not in TRUST_REMOTE_CODE_REPOS:
             continue
         code = [name for name in required if name.endswith(".py")]
@@ -712,7 +715,63 @@ def test_a_repo_needing_only_weights_is_unaffected() -> None:
     Their patterns stay minimal on purpose — the wheel supplies the Python, so
     pulling the repo's source would be dead weight on every cold start.
     """
-    for repo_id, _required, patterns, _weights in CACHED_REPOS:
+    for repo_id, _required, patterns, _glob in CACHED_REPOS:
         if repo_id in TRUST_REMOTE_CODE_REPOS or repo_id == ASR_REPO:
             continue
         assert "*.py" not in patterns or repo_id == MODEL_REPO, repo_id
+
+
+# =============================================================================
+# An index is not weights
+# =============================================================================
+#
+# The bug, from a live cover job on image v20 (2026-09-18):
+#
+#     cover mode: lyric transcription failed — Qwen/Qwen3-ASR-1.7B does not
+#     appear to have files named ('model-00001-of-00002.safetensors',
+#     'model-00002-of-00002.safetensors')
+#
+# The cache held `model.safetensors.index.json` and none of the shards it
+# names — the volume had been filled by an earlier image whose ASR patterns
+# lacked `*.safetensors`. The weights check accepted the index as proof of
+# weights, so boot verified a broken cache and the failure surfaced after 51 s
+# of real work inside a GPU job.
+#
+# `model.safetensors.index.json` is a *manifest*: a map from tensor names to
+# shard filenames. It is not a weight file, and nothing about its presence says
+# the shards exist.
+
+
+def test_an_index_alone_does_not_satisfy_the_weights_check(tmp_path: Path) -> None:
+    """The exact shape of the broken cache: config + index, no shards."""
+    (tmp_path / "config.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "model.safetensors.index.json").write_text('{"weight_map": {}}', encoding="utf-8")
+
+    missing = boot._missing_files(tmp_path, ("config.json",), boot.WEIGHTS_GLOB)
+
+    assert missing, (
+        "an index with no shards passed the weights check — this is the bug that "
+        "let a shard-less cache boot and fail 51 s into a job"
+    )
+    assert boot.WEIGHTS_GLOB in missing
+
+
+def test_the_weights_glob_is_a_glob_not_a_filename() -> None:
+    """A named spelling cannot cover both layouts; a glob can."""
+    assert boot.WEIGHTS_GLOB.startswith("*"), boot.WEIGHTS_GLOB
+    assert boot.WEIGHTS_GLOB.endswith(".safetensors")
+
+
+def test_no_repo_treats_the_index_as_weights() -> None:
+    """And the index is not smuggled in through `required` instead.
+
+    A sharded repo genuinely needs its index — but as a *separate* requirement,
+    not as the thing standing in for weights. The distinction is what the check
+    depends on.
+    """
+    for repo_id, required, _patterns, weights_glob in CACHED_REPOS:
+        assert weights_glob == boot.WEIGHTS_GLOB, repo_id
+        assert "model.safetensors.index.json" not in weights_glob
+        # Where the index IS required, it must be for a repo that ships shards.
+        if "model.safetensors.index.json" in required:
+            assert repo_id == ASR_REPO, f"{repo_id} requires an index but is not the sharded repo"
