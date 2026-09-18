@@ -334,7 +334,7 @@ def test_unwritable_workdir_is_a_named_failure(tmp_path: Path) -> None:
     """An unwritable volume must name itself, not surface as "Unhandled error".
 
     `_reset_dir` originally sat outside the try, so an `OSError` here escaped
-    the named-failure contract in `AGENTS.md`.
+    the named-failure contract: every failure is reported, never a bare traceback.
 
     This exercises the real `_reset_dir` — replacing it with a function that
     raises would bypass the very wrapping under test and prove nothing. A file

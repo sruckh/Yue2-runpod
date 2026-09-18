@@ -369,8 +369,8 @@ def _reset_dir(path: Path) -> None:
     """Start each job from an empty directory so artifacts cannot mix.
 
     Raises `WorkerError` rather than letting an `OSError` escape: an unwritable
-    volume is a named failure with a cause, and the contract in `AGENTS.md` is
-    that failures are reported, not that they reach the caller as a generic
+    volume is a named failure with a cause, and this worker's contract is that
+    failures are reported, not that they reach the caller as a generic
     "Unhandled worker error".
     """
     try:

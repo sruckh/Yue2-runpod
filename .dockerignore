@@ -21,7 +21,8 @@ setup/
 RESEARCH-NOTES.md
 *.md
 !worker/README.md
-!worker/AGENTS.md
+# `worker/AGENTS.md` is not listed: it is workspace-local and not in the repo,
+# so a negation for it would match nothing on a fresh clone.
 
 # Python build artifacts
 __pycache__/

@@ -43,7 +43,7 @@ Production verification below.
 | `.runpod/` | Endpoint config (`hub.json`) and three example payloads (`tests.json`). |
 | `tests/` | 146 tests across six suites. |
 | `.github/workflows/ci-test-worker.yml` | Lint, type check, tests, image build — no GPU or secrets needed. |
-| `README.md`, `AGENTS.md` | Operator docs and the local DOX work contract. |
+| `worker/README.md` | Operator docs. The `AGENTS.md` work contracts are workspace-local and not published. |
 
 Root-level config added: `pyrightconfig.json` (flat-module resolution),
 `ruff.toml`, `.dockerignore`.
