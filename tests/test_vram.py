@@ -378,3 +378,30 @@ def test_mig_mode_tolerates_a_missing_binary(monkeypatch: pytest.MonkeyPatch) ->
 
     monkeypatch.setattr(vram.subprocess, "run", boom)
     assert vram.mig_mode() == ""
+
+
+def test_an_unsupported_mig_field_is_not_flagged(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`[N/A]` is what nvidia-smi prints where the field is unsupported.
+
+    Flagging it would print `MIG=[N/A]` on every non-MIG run, training a reader
+    to ignore the flag — the opposite of the point. Only a genuine mode value
+    is worth surfacing.
+    """
+    for value in ("[N/A]", "N/A", "unknown", "Disabled", ""):
+        monkeypatch.setattr(vram, "available", lambda: (True, ""))
+        monkeypatch.setattr(vram, "mig_mode", lambda v=value: v)
+        monkeypatch.setattr(vram, "_read_device_memory", lambda: (500, 23034, "NVIDIA L4"))
+        sampler = vram.VramSampler(interval=0.01)
+        sampler.start()
+        time.sleep(0.08)
+        assert "MIG=" not in sampler.stop().render(), f"{value!r} was flagged as MIG"
+
+
+def test_a_real_mig_mode_is_flagged(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(vram, "available", lambda: (True, ""))
+    monkeypatch.setattr(vram, "mig_mode", lambda: "Enabled")
+    monkeypatch.setattr(vram, "_read_device_memory", lambda: (500, 97871, "NVIDIA RTX PRO 6000"))
+    sampler = vram.VramSampler(interval=0.01)
+    sampler.start()
+    time.sleep(0.08)
+    assert "MIG=Enabled" in sampler.stop().render()

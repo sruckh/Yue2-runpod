@@ -49,7 +49,14 @@ class SnapshotRecorder:
         org, name = repo_id.split("/", 1)
         snap = cache_dir / f"models--{org}--{name}" / "snapshots" / "deadbeef"
         snap.mkdir(parents=True, exist_ok=True)
-        files = REQUIRED_MODEL_FILES if repo_id == MODEL_REPO else REQUIRED_VAE_FILES
+        # Derive this repo's own spec rather than assuming one of two. The
+        # previous form wrote REQUIRED_VAE_FILES for *any* non-YuE2 repo, so a
+        # third and fourth repo appeared to download files they never asked for
+        # — and the presence check then failed against the fake.
+        spec = next((entry for entry in CACHED_REPOS if entry[0] == repo_id), None)
+        files = list(spec[1]) if spec else []
+        if spec and spec[3]:
+            files.append(spec[3][0])
         for filename in files:
             (snap / filename).write_bytes(b"x")
         if repo_id == MODEL_REPO:
@@ -643,3 +650,69 @@ def test_required_files_are_downloadable_and_weights_are_checked_by_layout() -> 
         f"{ASR_REPO} is sharded; requiring a single-file spelling is what failed a "
         f"production boot. Its required list is {asr[1]}."
     )
+
+
+# =============================================================================
+# `trust_remote_code` repos need their Python, not just their weights
+# =============================================================================
+#
+# The bug, from a live cover job (2026-09-18):
+#
+#     cover mode: melody transcription failed — ... it looks like
+#     m-a-p/SheetSage2 is not the path to a directory containing a file named
+#     configuration_sheetsage2.py
+#
+# `config.json` and the weights resolved; the *model code* did not. SheetSage2
+# and MERT are loaded with `trust_remote_code=True`, so transformers imports
+# `configuration_*.py`, `modeling_*.py` and every sibling those reach by relative
+# import. A pattern list of "config + weights" caches a repo that cannot load.
+#
+# The probe in `transcribe_sheetsage/` had `*.py` in its allow_patterns from the
+# start — the cache config was the one that omitted it.
+
+#: Repos whose `config.json` declares `auto_map`, meaning `trust_remote_code`
+#: will import their Python. Verified against the Hub on 2026-09-18.
+TRUST_REMOTE_CODE_REPOS = frozenset({"m-a-p/SheetSage2", "m-a-p/MERT-v2-FullSong"})
+
+
+def test_trust_remote_code_repos_download_their_python() -> None:
+    """A `*.py` pattern is mandatory for these, and must not be trimmed later.
+
+    Without it the download succeeds, the presence check passes, and the failure
+    surfaces at load time inside a GPU job — as a message about a missing
+    `configuration_*.py`, which reads like a cache miss rather than a pattern
+    omission.
+    """
+    for repo_id, _required, patterns, _weights in CACHED_REPOS:
+        if repo_id in TRUST_REMOTE_CODE_REPOS:
+            assert "*.py" in patterns, (
+                f"{repo_id} uses trust_remote_code, so its model code must be downloaded. patterns={patterns}"
+            )
+
+
+def test_trust_remote_code_repos_require_their_code_entry_points() -> None:
+    """Presence must include the files transformers actually imports.
+
+    A repo holding only `config.json` and weights would pass a weights-only
+    check and then fail at load. Requiring the two entry points makes the check
+    fail at *cache* time, where the error names the repo and the file.
+    """
+    for repo_id, required, _patterns, _weights in CACHED_REPOS:
+        if repo_id not in TRUST_REMOTE_CODE_REPOS:
+            continue
+        code = [name for name in required if name.endswith(".py")]
+        assert code, f"{repo_id} requires no .py file, so remote code is unchecked"
+        assert any("configuration" in name for name in code), f"{repo_id}: no configuration_*.py required"
+        assert any("modeling" in name for name in code), f"{repo_id}: no modeling_*.py required"
+
+
+def test_a_repo_needing_only_weights_is_unaffected() -> None:
+    """YuE2 and the VAE are loaded from the wheel, not from remote code.
+
+    Their patterns stay minimal on purpose — the wheel supplies the Python, so
+    pulling the repo's source would be dead weight on every cold start.
+    """
+    for repo_id, _required, patterns, _weights in CACHED_REPOS:
+        if repo_id in TRUST_REMOTE_CODE_REPOS or repo_id == ASR_REPO:
+            continue
+        assert "*.py" not in patterns or repo_id == MODEL_REPO, repo_id

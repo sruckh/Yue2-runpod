@@ -102,26 +102,46 @@ VAE_FILE_PATTERNS = (
 # 5.06 s with "We couldn't connect to 'https://huggingface.co' ... and it looks
 # like m-a-p/SheetSage2 is not the path to a directory containing a file named
 # config.json", which reads as a network fault and is really a scope error here.
+#: `*.py` is not an optimisation, it is the model code.
+#:
+#: SheetSage2 is loaded with `trust_remote_code=True`, so transformers imports
+#: `configuration_sheetsage2.py`, `modeling_sheetsage2.py`,
+#: `tokenization_sheetsage2.py` and every `*_sheetsage2.py` sibling those reach
+#: through relative imports. Omitting them fails the load with
+#:
+#:     ...it looks like m-a-p/SheetSage2 is not the path to a directory
+#:     containing a file named configuration_sheetsage2.py
+#:
+#: which reads as a cache miss and is really a missing file pattern. The probe
+#: in `transcribe_sheetsage/` had `*.py` from the start; this list did not.
 REQUIRED_SHEETSAGE_FILES = (
     "config.json",
-    "model.safetensors",
+    "configuration_sheetsage2.py",
+    "modeling_sheetsage2.py",
 )
 SHEETSAGE_FILE_PATTERNS = (
     *REQUIRED_SHEETSAGE_FILES,
+    "*.py",  # the remaining sibling modules the above import relatively
+    "model.safetensors",
     "model.safetensors.index.json",
+    "processor_config.json",
     "LICENSE",
 )
 #: SheetSage2's encoder parent — loaded inside SheetSage2's own
 #: `from_pretrained`, not named by any entrypoint here. See `config.MERT_REPO`.
+#: MERT is also `trust_remote_code` (its `auto_map` names
+#: `configuration_mert2.MERT2Config` and `modeling_mert2.MERT2Model`), and
+#: SheetSage2 additionally hashes both files for its integrity check.
 REQUIRED_MERT_FILES = (
     "config.json",
-    "model.safetensors",
+    "configuration_mert2.py",
+    "modeling_mert2.py",
 )
 MERT_FILE_PATTERNS = (
     *REQUIRED_MERT_FILES,
+    "*.py",  # any further siblings, since the code is loaded remotely
+    "model.safetensors",
     "model.safetensors.index.json",
-    "modeling_mert2.py",
-    "configuration_mert2.py",
     "LICENSE",
 )
 #: Qwen3-ASR-1.7B ships **sharded**, unlike every other repo here:

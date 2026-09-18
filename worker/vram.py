@@ -93,7 +93,11 @@ class VramReport:
         where = self.device_name or "unknown device"
         if self.device_total_mib:
             where += f" {self.device_total_mib} MiB"
-        if self.mig_mode and self.mig_mode.lower() != "disabled":
+        mig = self.mig_mode.strip().lower()
+        # "[N/A]" is what nvidia-smi prints where the driver does not support
+        # the field; "unknown" prints either. Neither is evidence of MIG, so
+        # neither is flagged — flagging them would cry wolf on every non-MIG run.
+        if mig and mig not in {"disabled", "n/a", "[n/a]", "unknown", "<n/a>"}:
             where += f" MIG={self.mig_mode}"
         parts = [f"peak {self.peak_mib} MiB on {where} (baseline {self.baseline_mib}, n={self.samples})"]
         parts += [f"{name}={peak} MiB" for name, peak in self.per_phase.items()]
