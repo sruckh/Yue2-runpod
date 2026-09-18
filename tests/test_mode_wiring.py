@@ -232,3 +232,77 @@ def test_cover_reaches_the_mode_with_a_local_path(
     assert reached["lyrics_supplied"] is True, "the caller's lyrics must be honoured"
     assert "error" not in result or "source_audio" not in str(result.get("error", ""))
     assert params.source_audio == str(source)
+
+
+# =============================================================================
+# The ASR environment toggle (unification experiment)
+# =============================================================================
+#
+# `cover`'s lyric transcription normally runs in `/opt/venvs/qwen3-asr`. The
+# unification question is whether it can run under YuE2's own stack instead. It
+# is a runtime switch so one image answers both configurations, because flipping
+# the image and rebuilding costs a build cycle to test and another to revert.
+
+
+def test_the_asr_toggle_defaults_to_its_own_venv(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unset means the isolated environment — the shipped, verified arrangement.
+
+    The experiment must be opt-in. A default that changed behaviour would put
+    every cover job on the unverified path without anyone asking.
+    """
+    monkeypatch.delenv("YUE2_ASR_IN_MAIN", raising=False)
+    import modes
+
+    assert modes._asr_venv() == modes.ASR_VENV
+
+
+def test_the_asr_toggle_selects_the_main_interpreter(monkeypatch: pytest.MonkeyPatch) -> None:
+    from subprocess_runner import MAIN_INTERPRETER
+
+    import modes
+
+    for value in ("1", "true", "TRUE", "yes", " yes "):
+        monkeypatch.setenv("YUE2_ASR_IN_MAIN", value)
+        assert modes._asr_venv() == MAIN_INTERPRETER, f"{value!r} should enable the experiment"
+
+
+def test_a_falsey_toggle_value_keeps_the_venv(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`"false"` must not enable it. Same trap as the `instrumental` flag.
+
+    A string is not a boolean, and `bool("false")` is `True`. Here that would
+    silently move every cover onto the unverified path for a caller who wrote
+    what they believed meant "off".
+    """
+    import modes
+
+    for value in ("0", "false", "no", "", "off", "2"):
+        monkeypatch.setenv("YUE2_ASR_IN_MAIN", value)
+        assert modes._asr_venv() == modes.ASR_VENV, f"{value!r} must not enable the experiment"
+
+
+def test_the_main_interpreter_is_not_a_venv_path() -> None:
+    """The sentinel must resolve to the running interpreter, not a bogus path.
+
+    `VENV_ROOT / "" / "bin" / "python"` is a path that looks plausible and never
+    exists, so the failure would surface as a subprocess that cannot start rather
+    than as an obvious mistake.
+    """
+    import sys
+
+    from subprocess_runner import MAIN_INTERPRETER, venv_python
+
+    assert MAIN_INTERPRETER == ""
+    assert venv_python(MAIN_INTERPRETER) == Path(sys.executable)
+
+
+def test_the_asr_stage_still_runs_as_a_subprocess_either_way() -> None:
+    """Unification removes a *venv*, not the process boundary.
+
+    The boundary is what releases ASR's VRAM before generation — a cover's peak
+    depends on it. If this toggle ever made ASR run in-process, the measured
+    headroom would be gone.
+    """
+    source = (Path(__file__).resolve().parent.parent / "worker" / "modes.py").read_text(encoding="utf-8")
+    assert "run_stage(" in source
+    # The toggle selects an interpreter; it must not bypass run_stage.
+    assert "_asr_venv()" in source

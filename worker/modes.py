@@ -41,13 +41,14 @@ re-renders the whole song — the waveform outside the edit is **not** preserved
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import abc_score
-from subprocess_runner import (  # noqa: F401  (re-exported for callers)
-    SubprocessError,
+from subprocess_runner import (
+    MAIN_INTERPRETER,
     run_stage,
     scratch_dir,
     write_request,
@@ -64,6 +65,29 @@ ASR_ENTRYPOINT = Path(__file__).parent / "transcribe_asr" / "run.py"
 #: Virtual environment directory names, under `subprocess_runner.VENV_ROOT`.
 SHEETSAGE_VENV = "sheetsage2"
 ASR_VENV = "qwen3-asr"
+
+
+def _asr_venv() -> str:
+    """Which environment runs the ASR stage — its own venv, or the main one.
+
+    `YUE2_ASR_IN_MAIN=true` runs the ASR child under the *main* interpreter
+    instead of `/opt/venvs/qwen3-asr`. That is the unification experiment: if
+    qwen_asr runs correctly on YuE2's stack, the ASR venv can be deleted and the
+    image loses ~5 GB and one environment.
+
+    It is a runtime switch rather than a rebuild so that one image answers both
+    configurations. The alternative — flipping the image and rebuilding — costs a
+    full build cycle to test, and a second to revert if the answer is no.
+
+    The subprocess boundary is unchanged either way: the stage still runs as a
+    child that exits before generation, so a cover's VRAM peak is unaffected.
+    Only the interpreter differs. See `worker/requirements.txt` for why the
+    accelerate pins do not block this.
+    """
+    if os.environ.get("YUE2_ASR_IN_MAIN", "").strip().lower() in {"1", "true", "yes"}:
+        return MAIN_INTERPRETER
+    return ASR_VENV
+
 
 #: Per-stage budgets. Transcription is bounded by song length; the checkpoints
 #: are lazy graphs, so these are generous but not unbounded.
@@ -210,7 +234,7 @@ def prepare_cover(params: SongParameters, workdir: Path) -> ModeResult:
     asr_dir = scratch_dir(workdir, "asr")
     write_request(asr_dir, {"audio": str(source), "language": None, "offline": True})
     asr = run_stage(
-        ASR_VENV,
+        _asr_venv(),
         ASR_ENTRYPOINT,
         asr_dir,
         timeout_seconds=ASR_TIMEOUT_SECONDS,

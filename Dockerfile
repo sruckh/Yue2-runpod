@@ -138,6 +138,22 @@ RUN pip install --no-cache-dir --upgrade "huggingface-hub==0.36.2" \
     && pip install --no-cache-dir --no-deps "/tmp/wheel/${YUE2_WHEEL}" \
     && rm -rf /tmp/wheel
 
+# `qwen-asr` into the **main** environment, for the unification experiment.
+#
+# `--no-deps` is load-bearing, not a shortcut. qwen-asr pins
+# `accelerate==1.12.0` and the YuE2 wheel pins `accelerate==1.13.0`; two exact
+# pins cannot both hold, and a resolver would either fail or quietly downgrade
+# accelerate under YuE2. Neither package imports accelerate (zero references in
+# either wheel), so the conflict is between two decorative pins — blocked on
+# nothing — and --no-deps sidesteps it. Everything qwen_asr actually imports is
+# already present above or pinned in worker/requirements.txt.
+#
+# Its declared `gradio`, `flask` and `vllm` are deliberately absent: they are the
+# CLI and the optional vllm backend, and the one inference-path vllm import sits
+# inside a `try/except`.
+RUN pip install --no-cache-dir --no-deps "qwen-asr==0.0.6" \
+    && python -c "import qwen_asr; print('qwen_asr importable in the main environment')"
+
 # --- isolated model-family environments (cover mode) --------------------------
 #
 # The cover path runs two more model families, and their dependencies cannot

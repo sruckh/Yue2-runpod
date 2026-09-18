@@ -39,6 +39,7 @@ import logging
 import os
 import shutil
 import subprocess
+import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -93,8 +94,18 @@ class SubprocessResult:
         return str(self.payload.get("error") or self.stderr_tail or f"{self.name} failed")
 
 
+#: Passed as a `venv_name` to mean "the interpreter running this worker".
+#:
+#: An explicit sentinel rather than `""`, which would resolve to
+#: `VENV_ROOT / "" / "bin" / "python"` — a path that happens to be wrong in a way
+#: that only surfaces as a subprocess that cannot start.
+MAIN_INTERPRETER = ""
+
+
 def venv_python(venv_name: str) -> Path:
     """The interpreter inside a model family's virtual environment."""
+    if venv_name == MAIN_INTERPRETER:
+        return Path(sys.executable)
     return VENV_ROOT / venv_name / "bin" / "python"
 
 
@@ -122,7 +133,7 @@ def run_stage(
     failed result — both mean the *image* is wrong, not that the job's input was
     bad, and a caller retrying a job cannot fix either.
     """
-    name = name or venv_name
+    name = name or venv_name or "main"
     python = venv_python(venv_name)
     if not python.is_file():
         raise SubprocessError(
