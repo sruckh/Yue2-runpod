@@ -26,11 +26,15 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     HF_HUB_DISABLE_TELEMETRY=1 \
-    # Default the HF cache to the network volume. `config.CacheConfig` sets this
-    # again at runtime from VOLUME_ROOT and must win; this is only so a
-    # container run without that env var does not write 12 GB to the container
-    # disk and die at the 20 GB limit.
-    HF_HOME=/runpod-volume/hf
+    # Point HuggingFace at RunPod's cache location. `config.CacheConfig` derives
+    # the same paths from VOLUME_ROOT at runtime and is authoritative; this is a
+    # belt-and-braces default so that even a step running before `apply_hf_env()`
+    # writes to the volume rather than filling the container disk.
+    #
+    # Keep in sync with CacheConfig.hf_home. The build cannot check that, and a
+    # divergence would be silent — which is exactly how the previous value
+    # (/runpod-volume/hf) sat here unnoticed while the code used a different path.
+    HF_HOME=/runpod-volume/huggingface-cache
 
 WORKDIR /app
 

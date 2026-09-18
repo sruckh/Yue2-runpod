@@ -12,6 +12,7 @@ validator, so the examples cannot rot unnoticed.
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 
@@ -88,6 +89,35 @@ def test_env_example_documents_every_mandatory_variable() -> None:
     example = (WORKER_DIR / ".env.example").read_text(encoding="utf-8")
     for required in ("B2_ENDPOINT_URL", "B2_KEY_ID", "B2_APP_KEY", "B2_BUCKET", "VOLUME_ROOT"):
         assert required in example, f"{required} is required but undocumented in .env.example"
+
+
+def test_dockerfile_hf_home_matches_the_configured_cache_path() -> None:
+    """The image's default HF path must equal what the code computes.
+
+    These are two independent declarations of the same location — one in the
+    Dockerfile, one derived from `VOLUME_ROOT` at runtime — and nothing at build
+    time compares them. That gap is not hypothetical: the Dockerfile carried
+    `/runpod-volume/hf` while the code used a different path, and it went
+    unnoticed because runtime always overwrote it. A divergence only bites when
+    something writes to the cache *before* `apply_hf_env()` runs, and then it
+    fills the container disk instead of the volume.
+    """
+    import re
+    from pathlib import Path
+
+    import config
+
+    dockerfile = (Path(config.WORKER_DIR).parent / "Dockerfile").read_text(encoding="utf-8")
+    # `HF_HOME=` sits on a continuation line inside the ENV instruction, so it
+    # is indented rather than at column zero.
+    match = re.search(r"^\s*HF_HOME=(\S+)\s*$", dockerfile, re.M)
+    assert match, "Dockerfile declares no HF_HOME default"
+
+    os.environ.pop("VOLUME_ROOT", None)
+    expected = str(config.CacheConfig().hf_home)
+    assert match.group(1) == expected, (
+        f"Dockerfile HF_HOME={match.group(1)!r} but CacheConfig.hf_home={expected!r} — they must agree"
+    )
 
 
 def test_invalid_payload_shape_is_rejected_not_crashed() -> None:
