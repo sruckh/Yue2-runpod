@@ -475,3 +475,49 @@ def test_the_cover_repos_are_required_not_merely_downloaded() -> None:
         assert "config.json" in required, f"{repo_id} does not require config.json"
         for name in required:
             assert name in patterns, f"{repo_id}: {name!r} is required but not downloaded"
+
+
+#: Cross-repo references recorded upstream, verified 2026-09-18 by reading each
+#: repo's `config.json`. A repo that loads another inside its own
+#: `from_pretrained` cannot be covered by scanning this repo's entrypoints —
+#: nothing here names the parent. Pinning the known chain lets a *change* be
+#: detected without the network.
+KNOWN_TRANSITIVE_LOADS = {
+    "m-a-p/SheetSage2": "m-a-p/MERT-v2-FullSong",
+}
+
+
+def test_a_parent_model_loaded_transitively_is_cached() -> None:
+    """The second instance of the offline-mode trap, one level deeper.
+
+    Caching `m-a-p/SheetSage2` is not enough: it is a 229 MB adapter, and
+    `SheetSage2Model.from_pretrained` fetches its 2.5 GB encoder parent
+    (`m-a-p/MERT-v2-FullSong`) at a revision pinned in SheetSage2's own
+    config.json. Nothing in *this* repo names that parent, so a scan of our
+    entrypoints cannot see it — which is exactly why it was missed.
+
+    The mapping is asserted against the cache list rather than fetched, so the
+    test needs no network. When upstream changes the chain this fails, and the
+    fix is to re-read the configs and update both.
+    """
+    cached = {repo for repo, _, _ in CACHED_REPOS}
+    for child, parent in KNOWN_TRANSITIVE_LOADS.items():
+        assert child in cached, f"{child} loads {parent} but is not itself cached"
+        assert parent in cached, (
+            f"{child} loads {parent} inside its own from_pretrained. Offline mode "
+            "is inherited by the subprocess, so an uncached parent is unreachable — "
+            "the cover job fails with a HuggingFace connection error that reads like "
+            "a network fault."
+        )
+
+
+def test_the_transitive_chain_is_documented_where_a_reader_will_look() -> None:
+    """The chain must be discoverable without re-reading upstream configs.
+
+    It was invisible once: `DEFAULT_MODEL` looked like the whole story. The note
+    in the entrypoint and the constant in `config` are what make it findable.
+    """
+    worker = Path(__file__).resolve().parent.parent / "worker"
+    entrypoint = (worker / "transcribe_sheetsage" / "run.py").read_text(encoding="utf-8")
+    assert "MERT-v2-FullSong" in entrypoint, "the transitive parent is not mentioned at the entrypoint"
+    assert "MERT_REPO" in (worker / "config.py").read_text(encoding="utf-8")

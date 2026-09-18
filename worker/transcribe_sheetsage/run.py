@@ -43,6 +43,11 @@ from pathlib import Path
 #: Model id and the prompt set for a melody task. `chord_full` is deliberately
 #: absent — this stage must return harmony-free melody.
 DEFAULT_MODEL = "m-a-p/SheetSage2"
+# SheetSage2 loads `m-a-p/MERT-v2-FullSong` internally, at a pinned revision
+# recorded in its own config.json. That parent is NOT named here and cannot be —
+# it is fetched inside SheetSage2's `from_pretrained` — so it must be cached
+# independently or offline mode makes it unreachable. `boot.CACHED_REPOS` covers
+# it; this note exists so the next reader does not have to re-derive the chain.
 MELODY_PROMPTS = ["timestamp", "downbeat_meter", "structure", "key", "melody_full"]
 
 

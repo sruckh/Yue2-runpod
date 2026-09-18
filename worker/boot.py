@@ -33,7 +33,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from config import ASR_REPO, MODEL_REPO, MODEL_WHEEL, SHEETSAGE_REPO, VAE_REPO, CacheConfig
+from config import ASR_REPO, MERT_REPO, MODEL_REPO, MODEL_WHEEL, SHEETSAGE_REPO, VAE_REPO, CacheConfig
 
 log = logging.getLogger(__name__)
 
@@ -111,6 +111,19 @@ SHEETSAGE_FILE_PATTERNS = (
     "model.safetensors.index.json",
     "LICENSE",
 )
+#: SheetSage2's encoder parent — loaded inside SheetSage2's own
+#: `from_pretrained`, not named by any entrypoint here. See `config.MERT_REPO`.
+REQUIRED_MERT_FILES = (
+    "config.json",
+    "model.safetensors",
+)
+MERT_FILE_PATTERNS = (
+    *REQUIRED_MERT_FILES,
+    "model.safetensors.index.json",
+    "modeling_mert2.py",
+    "configuration_mert2.py",
+    "LICENSE",
+)
 REQUIRED_ASR_FILES = (
     "config.json",
     "model.safetensors",
@@ -129,6 +142,10 @@ CACHED_REPOS = (
     (MODEL_REPO, REQUIRED_MODEL_FILES, MODEL_FILE_PATTERNS),
     (VAE_REPO, REQUIRED_VAE_FILES, VAE_FILE_PATTERNS),
     (SHEETSAGE_REPO, REQUIRED_SHEETSAGE_FILES, SHEETSAGE_FILE_PATTERNS),
+    # SheetSage2's encoder parent. `modeling_mert2.py` and its config are
+    # required because SheetSage2's integrity check hashes them — and because
+    # `trust_remote_code` loads MERT under the *SheetSage2* remote-code path.
+    (MERT_REPO, REQUIRED_MERT_FILES, MERT_FILE_PATTERNS),
     (ASR_REPO, REQUIRED_ASR_FILES, ASR_FILE_PATTERNS),
 )
 

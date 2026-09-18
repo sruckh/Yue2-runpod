@@ -36,6 +36,23 @@ MODEL_REPO = "m-a-p/YuE2-3B"
 VAE_REPO = "m-a-p/YuE2-Vae"
 #: Melody transcription for `cover`/`edit` (MERT-v2 encoder + SheetSage2 adapter).
 SHEETSAGE_REPO = "m-a-p/SheetSage2"
+#: SheetSage2's **encoder parent**, loaded inside its own `from_pretrained`
+#: rather than named by any entrypoint in this repo:
+#:
+#:     base_model_name_or_path = "m-a-p/MERT-v2-FullSong"
+#:     base_model_revision     = d8ba1c745e733b3908ce6ad16ebeb17ac7600a42
+#:
+#: It has to be cached for the same reason SheetSage2 does — offline mode is
+#: inherited by the subprocess, so an uncached parent is unreachable. This is the
+#: second repo found by that rule, one level deeper than the first: caching
+#: SheetSage2 alone still fails, because SheetSage2 is only a 229 MB adapter and
+#: the 2.5 GB encoder is what it actually fetches.
+#:
+#: Upstream `main` currently *is* the pinned revision, so a plain download
+#: serves SheetSage2's commit-hash lookup. If upstream moves, SheetSage2's own
+#: integrity check raises "MERT-v2 parent integrity check failed" naming the
+#: file — a loud failure, not a quietly wrong encoder.
+MERT_REPO = "m-a-p/MERT-v2-FullSong"
 #: Lyrics transcription for `cover`, from the recording's vocals.
 ASR_REPO = "Qwen/Qwen3-ASR-1.7B"
 MODEL_WHEEL = "yue2_infer-0.1.5-py3-none-any.whl"
