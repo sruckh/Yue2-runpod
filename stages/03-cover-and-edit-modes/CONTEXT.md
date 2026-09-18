@@ -49,3 +49,22 @@ as `create`, and confirm via VRAM sampling that no stage exceeded the
 
 ## Audits _(optional — creative stages)_
 - [ ] quality gate before writing output
+
+## Status caveat — read before trusting the ICM stage table
+
+The root `CONTEXT.md`'s generated table reports this stage **COMPLETE**. That is
+the ICM rule applied mechanically — *a stage is COMPLETE when its `output/` holds
+a file other than `.gitkeep`* — and this stage's `output/` does.
+
+**It does not mean this stage's `## Human check` has passed.** It has not. That
+check requires one `cover` job and one `edit` job on a 24 GB GPU with VRAM
+sampling, and no cover or edit job has ever run: the transcription models have
+never been invoked on real audio.
+
+Treat the mechanical status as "the build record is written", not as "the stage is
+done". The distinction is tracked in Outline as the task **"Stage 03 Human check —
+cover and edit on GPU"** (status `blocked`, needs hardware).
+
+Do not start a Stage 04, or treat cover/edit as production-ready, until that check
+passes. If the two ever disagree in the other direction — table says empty but
+output exists — the table is stale; run `icm sync`.
