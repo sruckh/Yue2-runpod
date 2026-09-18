@@ -67,13 +67,32 @@ RUN python -m py_compile /app/*.py && echo "all modules compile"
 # Confirm the wheel actually landed and imports (it has no boot side effects).
 RUN python -c "import yue2; print('yue2_infer', getattr(yue2, '__version__', 'unknown'))"
 
-# Build-time guard for the rule above: no model weights may exist anywhere in the
-# image. A future refactor that reintroduces an import-time boot, or a COPY that
-# pulls a checkpoint in, fails the build here instead of shipping a container
-# whose image is tens of gigabytes larger than it should be.
-RUN test -z "$(find / -xdev \( -name '*.safetensors' -o -name 'pytorch_model*.bin' \) -not -path '/proc/*' 2>/dev/null)" \
-    || { echo 'ERROR: model weights found in the image — weights belong on the network volume, never in the image'; \
-         find / -xdev -name '*.safetensors' -not -path '/proc/*' 2>/dev/null; exit 1; }
+# Build-time guard: no *model weights* may be baked into the image.
+#
+# Enforces locked decision 4, which was previously held by convention only — the
+# Dockerfile simply did not copy weights. Convention did not survive an unrelated
+# refactor: moving the pipeline boot into module scope made the old `import
+# handler` smoke test hydrate the network volume inside a build layer, and ~12 GB
+# of weights landed in the image. This assertion would have caught it.
+#
+# Size-filtered deliberately. The rule is about *weights* — hundreds of MB to
+# several GB — not about the extension. A dependency shipping a 2 KB
+# `.safetensors` test fixture is not a violation, and failing the build for one
+# would train whoever hits it to distrust or delete this check. Only files over
+# 50 MB are considered, which no fixture reaches and every real checkpoint
+# exceeds by orders of magnitude.
+RUN big=$(find / -xdev -type f \
+        \( -name '*.safetensors' -o -name 'pytorch_model*.bin' -o -name '*.ckpt' \) \
+        -size +50M -not -path '/proc/*' 2>/dev/null); \
+    if [ -n "$big" ]; then \
+        echo 'ERROR: model weights found in the image.'; \
+        echo 'Weights belong on the network volume, never in the image (locked decision 4).'; \
+        echo 'Likely cause: a step that imports handler.py, which boots the pipeline at module scope.'; \
+        echo 'Use `python -m py_compile` to check the code instead of importing it.'; \
+        echo "$big"; \
+        exit 1; \
+    fi; \
+    echo "weight guard: clean (no model weights over 50M in the image)"
 
 # `-u` keeps stdout/stderr unbuffered so RunPod's log stream shows progress
 # during a 70-second generation rather than in one burst at the end.
