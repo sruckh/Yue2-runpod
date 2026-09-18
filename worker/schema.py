@@ -37,9 +37,27 @@ from config import (
 #: after it.
 _ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,179}$")
 
-#: A FLAC of a long song is tens of MB. 2 MiB of UTF-8 is far more lyrics than
-#: any song needs and caps the damage a hostile caller can do to our memory.
+#: Guard against a caller posting an unbounded body, before any token counting.
 _MAX_TEXT_BYTES = 2 * 1024 * 1024
+
+#: Combined style + lyrics + abc budget, in bytes.
+#:
+#: The pipeline has a hard token ceiling, not a byte one: `sampling.py:62`
+#: raises `ValueError` when `len(prefix) + max_tokens > CONTEXT`, where CONTEXT
+#: is 24576 and the default `max_tokens` is 9000 — leaving ~15 576 tokens for
+#: the prompt. Measured against the real checkpoint tokenizer, the largest
+#: lyrics string that fits is on the order of 78 KB, and style and a supplied
+#: ABC each eat into that.
+#:
+#: 64 KiB is deliberately below the measured ceiling rather than at it: token
+#: density varies with language (CJK lyrics tokenize far denser per byte than
+#: English), and a limit that is right for one song is wrong for the next. The
+#: point is to refuse in microseconds what the pipeline would refuse after
+#: loading a 12 GB model, not to squeeze out the last kilobyte.
+#:
+#: This is a *pre-check*, not a substitute: `GenerationFailed` still catches the
+#: pipeline's own ValueError for anything that slips through.
+_MAX_PROMPT_BYTES = 64 * 1024
 
 
 class ValidationError(ValueError):
@@ -158,6 +176,18 @@ def validate_job(job: Mapping[str, Any] | None) -> SongParameters:
         # hang off, and `cot="off"` has none.
         if cot == "off":
             raise ValidationError("'abc' requires cot='melody' or cot='full'")
+
+    # The pipeline refuses an over-long prompt only after the model is resident,
+    # ~70 seconds in. Its ceiling is measured in tokens; ours is a conservative
+    # byte pre-check so the common case fails here instead.
+    prompt_bytes = len(style.encode("utf-8")) + len(lyrics.encode("utf-8"))
+    if abc is not None:
+        prompt_bytes += len(abc.encode("utf-8"))
+    if prompt_bytes > _MAX_PROMPT_BYTES:
+        raise ValidationError(
+            f"style + lyrics + abc is {prompt_bytes} bytes; the pipeline's context "
+            f"window allows about {_MAX_PROMPT_BYTES}. Shorten the lyrics or the style prompt."
+        )
 
     request_id = raw.get("id")
     if request_id is None:

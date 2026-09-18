@@ -158,6 +158,15 @@ class WorkerConfig:
     #: stderr, which is noise in a serverless log.
     show_progress: bool = field(default_factory=lambda: _env_bool("YUE2_PROGRESS", False))
     default_cot: str = field(default_factory=lambda: _env("DEFAULT_COT", DEFAULT_COT))
+    #: Which VAE decoder to build with. Default is the current release; the
+    #: `-legacy` repo exists only to reproduce the published benchmark protocol
+    #: (locked decision 6) and is not the default.
+    #:
+    #: This is *our* switch, honoured because `boot.load_pipeline` passes it as
+    #: `vae=` to `from_pretrained` and the response reports it back. Do not
+    #: confuse it with a package-side env var — the `yue2_infer` wheel reads no
+    #: environment variables at all on this code path.
+    vae_repo: str = field(default_factory=lambda: _env("YUE2_VAE_REPO", VAE_REPO))
     #: VRAM ceiling handed to the pipeline. It is not advisory: the pipeline turns
     #: this into `torch.cuda.set_per_process_memory_fraction((n-2)/total)`, so it
     #: caps the process hard. The pipeline's own default is 24 — an assumption
@@ -204,3 +213,8 @@ class WorkerConfig:
             raise ConfigError(
                 f"MEMORY_BUDGET_GIB must exceed the pipeline's 2 GiB reserve, got {self.memory_budget_gib}"
             )
+        # A budget of 0 reaches `signal.alarm(0)`, which *disarms* the alarm
+        # rather than setting a zero-second one — the guard would silently
+        # vanish instead of firing immediately.
+        if self.job_timeout_seconds <= 0:
+            raise ConfigError(f"JOB_TIMEOUT_SECONDS must be positive, got {self.job_timeout_seconds}")

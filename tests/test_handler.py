@@ -36,15 +36,23 @@ def valid_input(**overrides: Any) -> dict[str, Any]:
 def handler_module(volume: Path, fake_pipeline: Any, monkeypatch: pytest.MonkeyPatch) -> Any:
     """Import `handler` with the pipeline stubbed out.
 
-    `boot.load_pipeline` is patched *before* the module's lazy `get_pipeline()`
-    ever runs, so no torch import, no weights, no GPU.
+    Order matters and is the point: `boot.load_pipeline` is patched *before*
+    `handler` is imported, because `handler` boots at module import. Patching
+    afterwards would be too late — the real loader would already have run and
+    the module would be sitting in its failed-boot state.
+
+    `import boot` returns the already-imported module object, and `handler` does
+    the same, so the patch is visible to `boot_worker()` with no cooperation
+    from the production code.
     """
+    import boot
+
+    monkeypatch.setattr(boot, "load_pipeline", lambda *a, **k: fake_pipeline)
     module = importlib.import_module("handler")
-    importlib.reload(module)
-    monkeypatch.setattr(module.boot, "load_pipeline", lambda *a, **k: fake_pipeline)
-    module._pipeline = None
+    importlib.reload(module)  # re-runs the module-level boot, now against the stub
     yield module
     module._pipeline = None
+    module._boot_error = None
 
 
 class RecordingStorage:
@@ -202,14 +210,59 @@ def test_boot_failure_is_reported_not_raised(
     """
     from boot import BootError
 
+    # Simulate the import-time boot having failed. `boot_worker` records the
+    # failure rather than raising, so the module still imports and the handler
+    # can answer with the cause.
     def boom(*a: Any, **k: Any) -> Any:
         raise BootError("yue2_infer is not installed")
 
     monkeypatch.setattr(handler_module.boot, "load_pipeline", boom)
     handler_module._pipeline = None
-    result = handler_module.run_create_job({"id": "j", "input": valid_input()}, storage=recording_storage)
+    handler_module._boot_error = None
+    handler_module.boot_worker()
+
+    result = handler_module.handler({"id": "j", "input": valid_input()})
     assert "error" in result
     assert "yue2_infer is not installed" in result["error"]
+    # And the circuit breaker: the failure is remembered, not re-attempted.
+    assert handler_module._boot_error is not None
+
+
+def test_boot_failure_is_not_retried_per_job(
+    handler_module: Any, fake_pipeline: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed cold start must not turn every job into another cold start.
+
+    Regression guard: the boot was originally lazy, so a worker with an
+    unhydratable volume re-attempted a ~12 GB download inside *every* job's
+    timeout budget instead of failing once and staying failed.
+    """
+    from boot import BootError
+
+    attempts = []
+
+    def boom(*a: Any, **k: Any) -> Any:
+        attempts.append(1)
+        raise BootError("volume unavailable")
+
+    monkeypatch.setattr(handler_module.boot, "load_pipeline", boom)
+    handler_module._pipeline = None
+    handler_module.boot_worker()
+
+    for _ in range(3):
+        result = handler_module.handler({"id": "j", "input": valid_input()})
+        assert "error" in result
+
+    assert len(attempts) == 1, f"boot was re-attempted {len(attempts)} times"
+
+
+def test_boot_error_reaches_a_job_through_run_create_job(handler_module: Any, recording_storage: Any) -> None:
+    """`run_create_job` itself reports a failed boot rather than raising."""
+    handler_module._pipeline = None
+    handler_module._boot_error = RuntimeError("weights missing")
+    result = handler_module.run_create_job({"id": "j", "input": valid_input()}, storage=recording_storage)
+    assert "error" in result
+    assert "weights missing" in result["error"]
 
 
 def test_storage_failure_is_reported_not_raised(
@@ -271,10 +324,7 @@ def test_workdir_cleaned_up_even_when_upload_fails(
 # --- decoder reporting -------------------------------------------------------
 
 
-def test_decoder_defaults_to_the_current_vae(
-    handler_module: Any, recording_storage: Any, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.delenv("YUE2_VAE", raising=False)
+def test_decoder_defaults_to_the_current_vae(handler_module: Any, recording_storage: Any) -> None:
     result = handler_module.run_create_job({"id": "j", "input": valid_input()}, storage=recording_storage)
     assert result["decoder"] == "m-a-p/YuE2-Vae"
 
@@ -282,9 +332,25 @@ def test_decoder_defaults_to_the_current_vae(
 def test_legacy_decoder_is_reported_when_selected(
     handler_module: Any, recording_storage: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv("YUE2_VAE", "m-a-p/YuE2-Vae-legacy")
+    """`YUE2_VAE_REPO` is *our* switch, and the response must report what it set.
+
+    Regression guard: the field used to read `YUE2_VAE`, an env var that nothing
+    in the `yue2_infer` wheel reads — so the reported decoder was whatever the
+    variable claimed, regardless of which decoder actually ran.
+    """
+    monkeypatch.setenv("YUE2_VAE_REPO", "m-a-p/YuE2-Vae-legacy")
     result = handler_module.run_create_job({"id": "j", "input": valid_input()}, storage=recording_storage)
     assert result["decoder"] == "m-a-p/YuE2-Vae-legacy"
+
+
+def test_decoder_field_tracks_config_not_the_environment_directly(handler_module: Any, recording_storage: Any) -> None:
+    """The reported decoder comes from the config the pipeline was built with."""
+    from config import VAE_REPO, CacheConfig, WorkerConfig
+
+    cfg = WorkerConfig(cache=CacheConfig(), vae_repo="some/other-vae")
+    result = handler_module.run_create_job({"id": "j", "input": valid_input()}, storage=recording_storage, config=cfg)
+    assert result["decoder"] == "some/other-vae"
+    assert result["decoder"] != VAE_REPO
 
 
 # --- direct handler entrypoint ----------------------------------------------

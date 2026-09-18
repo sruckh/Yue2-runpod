@@ -46,7 +46,7 @@ FLAC does not belong in a job response.
 
 ```
 worker/
-├── handler.py       RunPod entrypoint; boot at import, generate per job
+├── handler.py       RunPod entrypoint; boots at import, generates per job
 ├── boot.py          Idempotent weight caching onto the network volume
 ├── schema.py        Job validation, mirroring the pipeline's own bounds
 ├── storage.py       Backblaze B2 egress over the S3 API
@@ -54,7 +54,7 @@ worker/
 ├── requirements.txt Exact pins — never a loose range (see below)
 ├── Dockerfile       python:3.12-slim + libsndfile1; wheel from the HF repo
 └── .runpod/         Endpoint config and example job payloads
-tests/               136 tests, GPU and B2 both mocked
+tests/               173 tests, GPU and B2 both mocked
 ```
 
 The modules use **flat imports** (`import config`, not `from worker import config`)
@@ -68,7 +68,7 @@ and getting that order wrong puts a 12 GB download on a 20 GB container disk.
 ### Locally (no GPU needed)
 
 ```bash
-python -m pytest tests/ -q          # 136 tests, no GPU, no network, no credentials
+python -m pytest tests/ -q          # 173 tests, no GPU, no network, no credentials
 ruff check worker tests && ruff format --check worker tests
 ```
 
@@ -119,6 +119,13 @@ bucket; it never needs `listBuckets`, because nothing here enumerates.
 Once the volume is warm, set `HF_LOCAL_FILES_ONLY=true` so a missing blob fails
 loudly instead of silently re-downloading.
 
+Two knobs worth knowing: `MEMORY_BUDGET_GIB` (default 24) is a **hard** VRAM cap
+— the pipeline turns it into `set_per_process_memory_fraction`, so lower it to run
+on a smaller card. `YUE2_VAE_REPO` selects the decoder; `m-a-p/YuE2-Vae-legacy`
+reproduces the published benchmark protocol and makes the worker fetch that repo
+too. Note this is *our* variable — the `yue2_infer` package reads no environment
+variables on this path.
+
 ## Design notes
 
 **Weights are never baked into the image.** Both repos — `m-a-p/YuE2-3B` and
@@ -132,8 +139,22 @@ after the model is resident — ~70 seconds before a caller learns their seed wa
 string.
 
 **Failures return structured errors.** Every path that can fail — validation,
-boot, generation, upload — returns `{"error": "..."}` rather than raising. A
-worker that dies on one bad job is a worker that keeps costing money.
+boot, generation, upload, response assembly — returns `{"error": "..."}` rather
+than raising. A worker that dies on one bad job is a worker that keeps costing
+money.
+
+**The pipeline is resident before the first job.** Boot runs at module import,
+not on first use. A lazy boot would put a ~12 GB download and model construction
+inside a job's own timeout budget, so the first job on a cold volume would be
+killed for taking longer than a generation may take. If boot fails, the failure
+is remembered and every job answers from it immediately — one cold start, not
+one per job.
+
+**`truncated` is derived, not coerced.** The pipeline's `SongResult.truncated` is
+a dict (`{"abc": bool, "semantic": bool}`), and `bool()` of a non-empty dict is
+always `True` — so a naive coercion reports every successful song as truncated.
+The response reports a real boolean plus `truncation_by_stage`, and reports
+`null` when the field is absent, because "not reported" is not "not truncated".
 
 **One decoder, named in the response.** `m-a-p/YuE2-Vae` is the default.
 `YuE2-Vae-legacy` is env-switchable for reproducing the published benchmark

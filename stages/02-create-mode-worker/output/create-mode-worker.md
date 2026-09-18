@@ -87,18 +87,32 @@ changed the build:
    callbacks, and `from_pretrained(progress=False)` to silence the progress
    spinner that would otherwise spam serverless logs.
 
-## Defects the loop caught
+## Defects found and fixed
 
-Each was found by running something, not by reading the code once:
+Eleven total. Six were caught during the build by running something; five were
+caught afterwards by independent critics — including two that produced a
+**successful response containing a false statement**, which no amount of green
+tests would have surfaced.
 
 | # | Defect | Found by | Fix |
 |---|---|---|---|
 | 1 | Every real job failed at upload — `WorkerConfig(cache=...)` left storage unset | test | `WorkerConfig.autoload()` |
 | 2 | `seed: true` silently became seed 1 (bools are ints) | test | reject before coercion |
-| 3 | Boot failure escaped as a traceback instead of a structured error | smoke run | `boot.BootError` added to the catch |
+| 3 | Boot failure escaped as a traceback instead of a structured error | smoke run | `BootError` added to the catch |
 | 4 | Object keys flattened; `..` survived sanitisation | test | per-segment `_safe_segment` |
 | 5 | `HF_XET_CACHE` used `setdefault`, so the bulk of a cold-start download could land on the container disk | test | assigned, not defaulted |
 | 6 | Storage resolved *after* generation — a bad bucket cost 70 s of GPU before failing | self-review | resolve storage before generating |
+| 7 | Boot was lazy despite its docstring; a ~12 GB download ran inside the first job's timeout, and every later job retried it | arch critic | `boot_worker()` at import + a circuit breaker |
+| 8 | `build_response()` outside the `try`, so the documented `--test_input` path crashed | arch critic | moved inside the `try` |
+| 9 | Cleanup ran before response assembly — local runs returned `file://` URLs to deleted files | arch critic | response built before cleanup |
+| 10 | Workdir keyed on the caller-supplied `id` alone — two same-id jobs destroyed each other's artifacts (silent corruption) | arch critic | per-invocation `uuid4` suffix |
+| 11 | **`truncated` is a dict** — `bool({...})` is always `True`, so every successful song was reported truncated | API critic | `_normalise_truncation()` |
+| 12 | **`YUE2_VAE` was invented** — zero hits in the package; the `decoder` field reported a name that changed nothing | API critic | `YUE2_VAE_REPO`, honoured via `vae=` |
+
+Defects 11 and 12 are the instructive ones: both are silent, both shipped through
+a green suite, and both were missed by a builder-run verification that checked
+*shape* rather than *semantics*. Full analysis, per-defect reasoning, and a
+correction to the comparison harness: **`review-findings.md`**.
 
 ## What this stage does *not* prove
 
@@ -121,46 +135,6 @@ Stated plainly, because the contract's Human check exists for exactly this:
 
 Needs: an RTX 4090-class GPU, a RunPod API key, B2 credentials, and a network
 volume. None exist on the machine this was built on.
-
-## Adversarial review
-
-Two critics were spawned with fresh context and no visibility into the builder's
-reasoning:
-
-- **Architecture critic** — blind A/B against `runpod-workers/worker-faster_whisper`
-  and `worker-comfyui`, labels stripped, order randomized per round.
-- **API critic** — instructed to check every pipeline call against the real
-  `yue2_infer-0.1.5` wheel source unpacked from the model repo.
-
-**Neither critic returned a report.** Both were spawned, both ran (the API critic
-was observed writing and executing probe scripts against the wheel), and both
-went idle without delivering findings, despite three requests. This is recorded
-as a failure of the review step, not as a clean bill of health — a critic that
-does not report is not a critic that found nothing.
-
-**In its place, the builder ran the API-contract check directly** against the
-same ground truth, by AST rather than regex, so it is reproducible:
-
-| Check | Method | Result |
-|---|---|---|
-| Call sites into the pipeline | AST walk of `handler.py` | exactly one: `pipe(**call_kwargs)` |
-| Kwargs vs `SongRequest` fields | AST of `protocol.py` | `style`, `lyrics`, `cot`, `seed`, `abc`, `cfg_scale` — all valid |
-| `from_pretrained` keywords | AST of `pipeline.py` | `progress`/`local_files_only` accepted directly; `device`/`memory_budget_gib` reach `__init__` via `**kwargs` |
-| `save_artifacts` output | AST + source of `SongResult`/`SymbolicPlan` | writes `audio.flac` and calls `plan.save()`, which writes `score.abc` |
-
-An earlier pass of this same check reported two failures. Both were false
-positives in the check itself — a loose regex that matched the *response* dict
-instead of the call kwargs, and a pattern that missed a `.write_bytes` call. They
-are noted because a self-run verification that cannot be wrong is not a
-verification; the first pattern was wrong twice before the AST version was
-trustworthy.
-
-**What this does not substitute for.** The architecture critic's blind A/B never
-happened, so no independent comparison against the RunPod bar was ever returned.
-The worker has been read against that bar by its builder (boot/caching, error
-taxonomy, response shape all follow it), but self-assessment is not the
-independent judgment the contest was set up to produce. Treat the architecture
-comparison as outstanding.
 
 ## Open question carried forward
 

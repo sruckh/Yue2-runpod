@@ -143,11 +143,11 @@ def _snapshot_download(
             token=cache.hf_token,
             local_files_only=cache.local_files_only,
             allow_patterns=list(allow_patterns),
-            # `local_dir` gives us a stable, inspectable tree; without this the
-            # hub writes only into its content-addressed cache and `local_dir`
-            # ends up holding symlinks that confuse the pipeline's own
-            # `resolve_model`.
-            local_dir_use_symlinks=False,
+            # No `local_dir_use_symlinks`: hf-hub 0.36.2 still declares the
+            # parameter but ignores it ("deprecated and will be ignored"), and
+            # the behaviour it used to request — real files under `local_dir`
+            # rather than symlinks into the content-addressed cache — is what
+            # `local_dir` does now. Passing it would suggest it still matters.
         )
     except Exception as exc:
         hint = ""
@@ -210,6 +210,21 @@ def install_model_wheel(cache: CacheConfig | None = None) -> Path:
     return wheel
 
 
+def _resolve_vae(config: Any, report: ModelCacheReport) -> Any:
+    """Pick the VAE directory for the decoder in use.
+
+    The default decoder is the one `ensure_models()` cached, so we pass the
+    local path — a local path cannot silently re-download. A non-default decoder
+    (the legacy benchmark repo) has not been cached by `ensure_models`, so its
+    repo id is passed instead and `resolve_model` fetches it into the HF cache.
+    """
+    requested = getattr(config, "vae_repo", None) or VAE_REPO
+    if requested == VAE_REPO:
+        return report.vae_dir
+    log.info("using non-default decoder %s (default is %s)", requested, VAE_REPO)
+    return requested
+
+
 def load_pipeline(config: Any = None, *, cache: CacheConfig | None = None) -> Any:
     """Construct the resident `YuE2Pipeline`. Once per worker lifetime.
 
@@ -246,7 +261,15 @@ def load_pipeline(config: Any = None, *, cache: CacheConfig | None = None) -> An
     started = time.perf_counter()
     log.info("loading YuE2Pipeline from %s (cache_hit=%s)", report.model_dir, report.cache_hit)
     try:
-        pipe = YuE2Pipeline.from_pretrained(str(report.model_dir), vae=str(report.vae_dir), **kwargs)
+        # `vae=` is the repo the decoder is actually built from, and the
+        # handler reports this same value back as `decoder`. `report.vae_dir`
+        # is where the default VAE was cached; a legacy override is passed by
+        # repo id so `resolve_model` fetches or resolves it itself.
+        pipe = YuE2Pipeline.from_pretrained(
+            str(report.model_dir),
+            vae=str(_resolve_vae(config, report)),
+            **kwargs,
+        )
     except Exception as exc:
         raise BootError(f"YuE2Pipeline.from_pretrained failed: {exc}") from exc
 

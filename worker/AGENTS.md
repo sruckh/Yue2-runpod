@@ -29,7 +29,7 @@ layout of the reference RunPod workers. `pyrightconfig.json` sets
 
 **`handler.py` must call `apply_hf_env()` before importing anything that touches
 HuggingFace.** The cache location is read at import time; getting this order
-wrong writes a 12 GB download to the 20 GB container disk and fails there rather
+wrong writes a 12 GB download to the container disk and fails there rather
 than here. The `# noqa: E402` on the imports below it is load-bearing.
 
 ### Every version is an exact pin
@@ -47,10 +47,46 @@ combination that imports and then fails mid-generation.
 
 ### Failures return, they do not raise
 
-Every path that can fail — validation, boot, generation, upload — returns
-`{"error": "..."}`. A worker that dies on one bad job is a worker that keeps
-costing money. If you add a new failure mode, add it to the handler's catch tuple
-**and** to `tests/test_handler.py`; a missing `BootError` there was a real bug.
+Every path that can fail — validation, boot, generation, upload, response
+assembly — returns `{"error": "..."}`. A worker that dies on one bad job is a
+worker that keeps costing money. If you add a new failure mode, add it to the
+handler's catch tuple **and** to the tests; a missing `BootError` there was a
+real bug.
+
+### The pipeline boots at import, and that is load-bearing
+
+`boot_worker()` runs as the last statement of `handler.py`. Do not make it lazy.
+A lazy first load puts a ~12 GB download plus model construction inside a *job's*
+timeout budget, so the first job on a cold volume gets killed for taking longer
+than a generation is allowed to take. A failed boot is recorded in `_boot_error`
+and reported per job — one cold start, never one per job.
+
+Tests import this module with `boot.load_pipeline` already patched. Patch before
+importing, or the real loader runs.
+
+### What the pipeline reports is not always what it looks like
+
+Two traps found the hard way, both silent — a green suite and a `200` response
+through both:
+
+- **`SongResult.truncated` is a dict**, not a bool (`{"abc": ..., "semantic": ...}`).
+  `bool()` of it is always `True`. Derive summary flags from values, never from
+  a container's truthiness. See `_normalise_truncation`.
+- **The `yue2_infer` package reads no environment variables** on this code path.
+  A config knob only works if *we* honour it — e.g. `YUE2_VAE_REPO` works because
+  `boot.load_pipeline` passes it as `vae=`. Do not invent a variable and report
+  it back as provenance; report what the pipeline was actually built with.
+
+### Test doubles must match the real artifact shapes
+
+`tests/conftest.py`'s `FakeSong` writes the exact artifact set the real
+`save_artifacts` produces — including `truncated` as a dict. A double that is
+convenient rather than faithful is worse than no double: it makes the suite green
+about behaviour the pipeline never exhibits.
+
+`tests/test_review_regressions.py` holds the tests named for the defects that got
+through. Keep it that way — each one documents a failure mode, not just an
+assertion.
 
 ### Validation mirrors the pipeline's bounds
 
@@ -73,7 +109,7 @@ temporarily, not even for a test.
 ## Verification
 
 ```bash
-python -m pytest tests/ -q                              # 112 tests, no GPU, no network
+python -m pytest tests/ -q                              # 173 tests, no GPU, no network
 ruff check worker tests && ruff format --check worker tests
 python -c "import config, schema, storage, boot, handler"   # from worker/
 ```

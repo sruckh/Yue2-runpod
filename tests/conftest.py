@@ -117,9 +117,17 @@ class FakeSong:
     exercised for real rather than mocked out.
     """
 
-    def __init__(self, audio_seconds: float = 214.85, sample_rate: int = 48000) -> None:
+    def __init__(
+        self,
+        audio_seconds: float = 214.85,
+        sample_rate: int = 48000,
+        truncated_abc: bool = False,
+        truncated_semantic: bool = False,
+    ) -> None:
         self.audio_seconds = audio_seconds
         self.sample_rate = sample_rate
+        self.truncated_abc = truncated_abc
+        self.truncated_semantic = truncated_semantic
         self.saved_to: str | None = None
 
     def save(self, path: str) -> str:
@@ -140,7 +148,13 @@ class FakeSong:
             json.dumps(
                 {
                     "status": "complete",
-                    "truncated": False,
+                    # A DICT, not a bool. `SongResult.truncated` is a property
+                    # returning `{"abc": bool, "semantic": bool}`
+                    # (pipeline.py:90-91), written here verbatim
+                    # (pipeline.py:113). This double originally wrote a scalar,
+                    # which is why the suite could not see the handler turning
+                    # every completed song into `truncated: true` via `bool()`.
+                    "truncated": {"abc": self.truncated_abc, "semantic": self.truncated_semantic},
                     "sample_rate": self.sample_rate,
                     "audio_seconds": self.audio_seconds,
                     "timing": {"abc": 1.0, "semantic": 2.0, "nar_seconds": 3.0},
