@@ -60,6 +60,12 @@ _MAX_TEXT_BYTES = 2 * 1024 * 1024
 _MAX_PROMPT_BYTES = 64 * 1024
 
 
+#: The modes this worker accepts. Defined here rather than in `modes.py` so the
+#: validator owns the vocabulary and `modes.py` can import it without a cycle.
+CREATE, COVER, EDIT = "create", "cover", "edit"
+MODES = (CREATE, COVER, EDIT)
+
+
 class ValidationError(ValueError):
     """Bad job input. Safe to return verbatim to the caller."""
 
@@ -81,6 +87,15 @@ class SongParameters:
     #: Per-job artifact directory name. Defaults to a value derived from the job
     #: id so two concurrent jobs on the same worker cannot collide.
     id: str
+    #: `cover` only: local path to the recording being covered. The handler
+    #: fetches it from the job's URL before dispatch, so this is always a path on
+    #: the container's disk by the time a mode sees it.
+    source_audio: str | None = None
+    #: `cover` only: whether the caller supplied lyrics rather than relying on
+    #: transcription. The upstream reference says to "obtain or check the lyrics
+    #: separately" — a listener usually knows them better than an ASR pass over a
+    #: full mix does, so an explicit lyric wins over the transcription.
+    lyrics_supplied: bool = False
 
     def to_request_json(self) -> dict[str, Any]:
         """The subset we echo back in the response and persist beside the audio."""
@@ -160,8 +175,25 @@ def validate_job(job: Mapping[str, Any] | None) -> SongParameters:
     if not isinstance(raw, Mapping):
         raise MissingInputError("job is missing an 'input' object")
 
+    # Resolved here so the per-mode lyric rule below has it. The handler calls
+    # `validate_mode` as well, but this function must be usable on its own.
+    mode = validate_mode(raw)
+
     style = _require_text(raw.get("style"), "style")
-    lyrics = _require_text(raw.get("lyrics"), "lyrics")
+
+    # Lyrics are required for `create` and `edit`, but **not** for `cover`: a
+    # cover's words come from the recording, transcribed by Qwen3-ASR. Requiring
+    # them unconditionally would make the whole cover path unusable and would
+    # contradict the upstream reference, which says to "obtain or check the
+    # lyrics separately" — supplying them is an *option*, not a precondition.
+    #
+    # `validate_mode_inputs` has already confirmed the mode is one this worker
+    # knows, so an unrecognised mode never reaches here.
+    lyrics_raw = raw.get("lyrics")
+    if mode == COVER:
+        lyrics = _require_text(lyrics_raw, "lyrics") if lyrics_raw is not None else ""
+    else:
+        lyrics = _require_text(lyrics_raw, "lyrics")
     cot = _resolve_cot(raw.get("cot"))
     seed = _coerce_seed(raw.get("seed"))
     cfg_scale = _coerce_cfg_scale(raw.get("cfg_scale"))
@@ -197,6 +229,15 @@ def validate_job(job: Mapping[str, Any] | None) -> SongParameters:
     elif not isinstance(request_id, str) or not _ID_PATTERN.fullmatch(request_id) or request_id in {".", ".."}:
         raise ValidationError(f"'id' must match {_ID_PATTERN.pattern}, got {request_id!r}")
 
+    # `cover` fields, validated above by `validate_mode_inputs` — but checking
+    # that a key exists in the raw input and then not carrying it forward is
+    # precisely how three cover bugs shipped at once. They must reach the params.
+    source_audio = raw.get("source_audio")
+    # A caller-supplied lyric wins over the transcription. Detected here rather
+    # than inferred in the mode, because only this layer knows whether the key
+    # was present or merely defaulted.
+    lyrics_supplied = "lyrics" in raw
+
     return SongParameters(
         style=style,
         lyrics=lyrics,
@@ -205,6 +246,8 @@ def validate_job(job: Mapping[str, Any] | None) -> SongParameters:
         cfg_scale=cfg_scale,
         abc=abc,
         id=request_id,
+        source_audio=str(source_audio) if source_audio is not None else None,
+        lyrics_supplied=lyrics_supplied,
     )
 
 
@@ -214,18 +257,35 @@ def _sanitise_id(value: str) -> str:
 
 
 def validate_mode(raw: Mapping[str, Any] | None) -> str:
-    """Resolve the worker's `mode` field.
+    """Resolve the worker's `mode` field: `create`, `cover` or `edit`.
 
-    Only `create` is implemented in this stage. `cover` and `edit` are named in
-    the locked product decisions and arrive in Stage 03 — rejecting them by name
-    (rather than as an unknown value) tells a caller the difference between
-    "you made a typo" and "not built yet".
+    All three are implemented. An unrecognised value is rejected here rather
+    than deep inside a pipeline, so a typo fails in microseconds.
     """
     if not isinstance(raw, Mapping):
-        return "create"
-    mode = raw.get("mode", "create")
-    if mode == "create":
-        return "create"
-    if mode in {"cover", "edit"}:
-        raise ValidationError(f"mode {mode!r} is not implemented in this worker build (Stage 03)")
-    raise ValidationError(f"'mode' must be 'create', got {mode!r}")
+        return CREATE
+    mode = raw.get("mode", CREATE)
+    if mode in MODES:
+        return str(mode)
+    raise ValidationError(f"'mode' must be one of {list(MODES)}, got {mode!r}")
+
+
+def validate_mode_inputs(mode: str, raw: Mapping[str, Any] | None) -> None:
+    """Check the fields a mode needs but that `validate_job` cannot know about.
+
+    Separate from `validate_job` because these requirements are per-mode;
+    folding them in would make `create` reject payloads it has no opinion about.
+    Called by the handler once the mode is known.
+    """
+    if mode != COVER:
+        return
+    if not isinstance(raw, Mapping):
+        raise ValidationError("cover mode requires an 'input' object with 'source_audio'")
+    source = raw.get("source_audio")
+    if source is None:
+        raise ValidationError(
+            "cover mode requires 'source_audio' — a URL or base64 payload for the recording to cover. "
+            "YuE2 has no direct audio-upload argument; the recording is transcribed first."
+        )
+    if not isinstance(source, str) or not source.strip():
+        raise ValidationError("'source_audio' must be a non-empty string")

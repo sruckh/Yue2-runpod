@@ -1,0 +1,156 @@
+# Stage 03 — cover and edit modes: build record
+
+> What was built, what it deviates from, and what only the container run can
+> prove. The code lives in `worker/`; this file describes it.
+
+## Status
+
+**Built and statically verified. Awaiting the stage's `## Human check`.**
+
+| Check | Result |
+|---|---|
+| Test suite | 261 passing (was 188) — no GPU, no network, no model libraries |
+| Lint / format | clean |
+| `py_compile` | clean |
+| Import safety | asserted by test: no module in the worker process imports torch/transformers/qwen_asr |
+| Container run | **not possible here** — no GPU, and packages must not be installed on this box |
+
+## What was built
+
+| Artifact | Role |
+|---|---|
+| `worker/modes.py` | Mode dispatch; the cover and edit pipelines |
+| `worker/abc_score.py` | ABC validation and chord stripping, adapted from upstream (Apache 2.0) |
+| `worker/subprocess_runner.py` | Runs a model family in its own venv; file-based protocol |
+| `worker/transcribe_sheetsage/run.py` | Melody transcription, executed in the sheetsage2 venv |
+| `worker/transcribe_asr/run.py` | Lyric transcription, executed in the qwen3-asr venv |
+| `Dockerfile` | Builds both venvs into the image |
+| `tests/test_modes.py`, `tests/test_abc_score.py`, `tests/test_mode_wiring.py` | 73 new tests |
+
+## The bar, and what it found
+
+The bar was the YuE2 authors' own implementation, which turned out to exist and
+to be directly comparable: `skills/yue2-music/` in
+`github.com/multimodal-art-projection/YuE` ships their SheetSage2 transcribe
+script, an ABC parsing/validation library (`abc_tools.py`), the documented
+cover and edit flows, and tests for the melody-only path. Apache 2.0, same as
+this repository.
+
+Reading it contradicted `shared/model-facts.md` in ways that would have produced
+a working-looking but wrong cover:
+
+**1. The SheetSage2 `transcribe()` signature is richer than recorded.** Our notes
+said `model.transcribe("song.mp3", output_dir=..., melody_only=True)`. The real
+call takes `prompts=[...]`, `dtype`, `preset`, `max_seconds`, and
+`base_model_path`. The prompt set is the mechanism that keeps chords out:
+melody tasks get `["timestamp","downbeat_meter","structure","key","melody_full"]`
+and `full` adds `chord_full`. **We now pass the melody prompt set and never
+`chord_full`.**
+
+**2. `melody_only` is not guaranteed to exist on a given revision.** Upstream
+inspects the signature and refuses rather than guessing — *"refresh the model
+code to a reviewed revision exposing melody_only explicitly"*. We do the same,
+because the failure mode is a run that returns chords while we believe we asked
+for a melody.
+
+**3. Transcribing and lyric-writing are separate operations.** Upstream is
+explicit: *"Source-separation, transcription, lyric recognition and
+score-conditioned generation are distinct operations"*, and for an audio cover
+you transcribe the melody, review it, remove chord annotations, and *"obtain or
+check the lyrics separately"*. The contract implied one pass; it is two.
+
+**4. `strip_chords` exists and is load-bearing.** Upstream ships a
+chord-removal function whose own invariant is *"Chord removal changed melody"*.
+We adapt it, and added a defence the contract did not ask for: `cover` now
+verifies the returned melody is chord-free rather than trusting
+`melody_only=True`, because **YuE2's `cot="melody"` does not strip chords
+itself** — a melody that still carries harmony silently produces something that
+is not a cover.
+
+## Deviations from the Roadmap
+
+1. **`worker/abc_score.py`, `subprocess_runner.py` — not in the contract.** The
+   contract named `modes.py` plus two subprocess directories. The ABC validator
+   and the subprocess runner are separate modules because both are independently
+   testable and both carry logic worth isolating. `abc_score` in particular
+   enforces the format contract the whole cover path depends on.
+2. **The venv layout is `/opt/venvs/<family>/`, not under `worker/`.** The
+   contract said `worker/transcribe_sheetsage/` and `worker/transcribe_asr/` hold
+   the subprocess code, which they do — but the *environments* are built to
+   `/opt/venvs/` so that `COPY worker/ /app/` does not overwrite them and so the
+   image layout is visible in one place. The entrypoints stay with the worker
+   code, as specified.
+3. **`validate_mode_inputs` added to `schema.py`.** Per-mode requirements (cover
+   needs `source_audio`) had no home; folding them into `validate_job` would make
+   `create` reject payloads it has no opinion about.
+4. **`abc.py` was renamed to `abc_score.py`.** The first name shadows Python's
+   stdlib `abc` module for anything importing it — a silent hazard, caught before
+   it landed.
+
+## Defects found and fixed during this stage
+
+| # | Defect | Found by |
+|---|---|---|
+| 1 | `abc.py` shadowed the stdlib `abc` module | builder, on import |
+| 2 | `strip_chords` dropped the trailing newline from every rewritten line, merging music lines and **corrupting the score** | the note-invariant check inside `strip_chords`, added for exactly this |
+| 3 | `L:1/24` passed validation — the regex accepted any `1/N`, so a validator laxer than its consumer | a test written to assert the rejection |
+| 4 | The unit-denominator check was documented but not implemented | the same test |
+| 5 | A child exiting non-zero with no `result.json` reported only "exited 1", discarding the stderr that explains it | a test asserting the message content |
+| 6 | `voices` accumulated duplicates from repeated `V:` headers | a test on a real score |
+| 7 | A test asserted `assert X or True` — vacuous, could never fail | ruff |
+| 8 | **`source_audio` was validated but never carried onto `SongParameters`**, so `params.source_audio` was always `None` and every cover job failed | self-review |
+| 9 | **`lyrics_supplied` was declared and read but set by nothing** — a caller supplying their own lyrics silently got the transcription instead | self-review |
+| 10 | **The handler never fetched the recording from its URL**, so the mode received a URL where it needed a path | self-review |
+| 11 | **`lyrics` was unconditionally required**, which made every cover job impossible: a cover's words come from transcription | self-review |
+| 12 | A child exiting non-zero without a `result.json` reported only the exit code | test |
+
+Defects 2, 8, 9, 10 and 11 are the instructive ones, and they split into two
+kinds.
+
+**Defect 2** — the file-based rewrite lost line endings and silently merged
+measures — was caught by a check the *upstream* code also performs. That is the
+argument for porting an invariant rather than a function: the invariant knew
+something the function's author did not.
+
+**Defects 8–11 are one failure mode wearing four faces: plumbing that was never
+connected.** A field validated and not carried forward; a flag read and never
+set; a URL handed where a path was needed; a required field that contradicts the
+mode's own premise. Every one of them is invisible to a test that constructs
+`SongParameters(...)` by hand — which is exactly what the mode and subprocess
+suites do.
+
+They were found by tracing one raw job end to end rather than by reading code,
+and the fix is structural: `tests/test_mode_wiring.py` now goes in through
+`validate_job` and the handler, so a field that exists in validation and is
+never used by the mode fails a test rather than a customer's job.
+
+They were also found *late* — after the suite was green at 248 tests. A green
+suite that never exercises the seam between two tested components is not
+evidence about the seam.
+
+## What this stage does **not** prove
+
+- **Neither venv has ever been built.** They are created in the RunPod image
+  build; the local suite mocks the subprocess boundary entirely.
+- **No transcription has run.** SheetSage2 and Qwen3-ASR have not been invoked.
+- **The cover chain is unverified end to end** — including whether SheetSage2's
+  prompt set returns the ABC shape our validator accepts.
+- **VRAM has not been sampled.** The sequential-loading design's whole premise is
+  that no stage exceeds the `create` peak; that needs a GPU to confirm.
+
+### The Human check
+
+> Run one `cover` job and one `edit` job end-to-end on the same 24 GB GPU tier as
+> `create`, and confirm via VRAM sampling that no stage exceeded the create-job
+> peak (14.08 GiB) before calling this stage complete.
+
+## Open questions for Stage 03
+
+- **The `.env.example` and endpoint config need the venv path** and any new
+  variables (`YUE2_VENV_ROOT`).
+- **SheetSage2's own `requirements.txt` is fetched at build time** from the HF
+  repo rather than pinned here — it is not published on PyPI and its contents may
+  change. Pinning it would mean copying it into the repo after a verified build.
+- **The Qwen3-ASR torch pin is unknown** (`dependency-pins.md` records no torch
+  pin for it), so its venv resolves torch at build time. Worth pinning after the
+  first successful build.

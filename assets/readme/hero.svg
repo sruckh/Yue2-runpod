@@ -10,9 +10,9 @@
 <text x="64" y="148" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', sans-serif" font-size="50" font-weight="600" fill="#E9EEF2" letter-spacing="-1.1">Style and lyrics</text>
 <text x="64" y="198" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', sans-serif" font-size="50" font-weight="600" fill="#E9EEF2" letter-spacing="-1.1">become a song.</text>
 <text x="64" y="242" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', sans-serif" font-size="16" fill="#7C8B98">YuE2-3B plans the music as an ABC score first, then realizes it</text>
-<text x="64" y="265" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', sans-serif" font-size="16" fill="#7C8B98">as 48 kHz stereo audio. One request, one song, one GPU.</text>
+<text x="64" y="265" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', sans-serif" font-size="16" fill="#7C8B98">as 48 kHz stereo audio. Create, cover, or edit a score.</text>
 <line x1="64" y1="300" x2="560" y2="300" stroke="#22303B" stroke-width="1"/>
-<text x="64" y="330" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12.5" fill="#7C8B98">one request &#183; one song &#183; one GPU</text>
+<text x="64" y="330" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12.5" fill="#7C8B98">create &#183; cover &#183; edit &#183; one endpoint</text>
 <text x="64" y="352" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12.5" fill="#7C8B98">weights cached on the volume, never in the image</text>
 </g>
 <g id="score-panel">

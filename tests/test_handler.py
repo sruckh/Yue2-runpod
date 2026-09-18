@@ -195,10 +195,13 @@ def test_invalid_seed_returns_error_without_generating(
     assert fake_pipeline.calls == []
 
 
-def test_cover_mode_rejected_with_stage_03_message(handler_module: Any, recording_storage: Any) -> None:
+def test_cover_mode_without_source_audio_is_rejected(handler_module: Any, recording_storage: Any) -> None:
+    """Previously this asserted cover was unimplemented. Stage 03 implements it,
+    so the same call now fails for the reason that still applies: a cover has no
+    input without a recording, and YuE2 takes no audio argument itself."""
     result = handler_module.run_create_job({"id": "j", "input": valid_input(mode="cover")}, storage=recording_storage)
     assert "error" in result
-    assert "Stage 03" in result["error"]
+    assert "source_audio" in result["error"]
 
 
 def test_generation_failure_is_reported_not_raised(

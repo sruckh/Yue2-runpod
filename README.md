@@ -13,7 +13,9 @@ song — vocals and accompaniment, 48 kHz stereo — on a single 24 GB GPU. Buil
 [YuE2-3B](https://huggingface.co/m-a-p/YuE2-3B), which plans the music as an ABC
 score first and then realizes it as audio.
 
-One request in, one song out, and nothing for you to run.
+Three modes, one endpoint: **create** a song from a prompt, **cover** an existing
+recording in a new style, or **edit** a score and re-render it. Nothing for you to
+run.
 
 ## What you send, what you get
 
@@ -47,6 +49,31 @@ One request in, one song out, and nothing for you to run.
 
 The response carries **URLs and metadata, never audio bytes**. A full song does
 not belong in a job response, and polling stays cheap.
+
+## The three modes
+
+| `mode` | You send | It does |
+|---|---|---|
+| `create` | style + lyrics | generates a song |
+| `cover` | a recording + a target style | transcribes the melody and lyrics, then generates a cover |
+| `edit` | a revised `score.abc` | re-renders the song from the edited score |
+
+```jsonc
+// cover — the recording supplies both the melody and the words
+{
+  "input": {
+    "mode":         "cover",
+    "source_audio": "https://…/original.mp3",
+    "style":        "Jazz-funk, Rhodes piano, brushed drums",
+    "lyrics":       "…"          // optional: omit and Qwen3-ASR transcribes them
+  }
+}
+```
+
+A cover's melody is transcribed to a **melody-only** ABC score and verified free
+of chord symbols before generation, because YuE2's `cot="melody"` does not strip
+chords itself. Editing re-renders the whole song — the waveform outside the edit
+is not preserved.
 
 ## How it works
 
@@ -82,6 +109,11 @@ worker/
 ├── schema.py              job validation, mirroring the pipeline's own bounds
 ├── storage.py             Backblaze B2 egress over the S3 API
 ├── config.py              environment-driven settings
+├── modes.py               create | cover | edit dispatch
+├── abc_score.py           ABC validation and chord stripping
+├── subprocess_runner.py   runs a model family in its own venv
+├── transcribe_sheetsage/  audio → melody.abc   (own venv)
+├── transcribe_asr/        audio → lyrics.txt   (own venv)
 ├── requirements.txt       exact pins — never a loose range
 └── .runpod/               endpoint config and example job payloads
 tests/                     GPU and B2 both mocked — runs with no hardware
@@ -104,7 +136,9 @@ Push, then watch the endpoint's **Builds** tab.
 1. Import this repo as a Serverless endpoint. The Dockerfile is at the root, so
    no build-path configuration is needed.
 2. Attach a network volume at `/runpod-volume`.
-3. Declare `m-a-p/YuE2-3B` and `m-a-p/YuE2-Vae` under **cached models**.
+3. Declare `m-a-p/YuE2-3B`, `m-a-p/YuE2-Vae`, `m-a-p/SheetSage2` and
+   `Qwen/Qwen3-ASR-1.7B` under **cached models** — the last two are only needed
+   for `cover`. SheetSage2 pulls its `m-a-p/MERT-v2-FullSong` parent automatically.
 4. Set the four storage variables on the endpoint template:
 
    ```
@@ -145,11 +179,10 @@ Anything inspecting the code uses `python -m py_compile`, never `import`.
 
 ## Current scope
 
-**Create mode is implemented and verified end to end.** The worker accepts
-`mode: "create"` and rejects `cover` and `edit` by name, so a caller gets
-`not implemented in this worker build (Stage 03)` rather than a confusing
-validation error. Cover and edit modes — requiring SheetSage2 and Qwen3-ASR as
-isolated subprocess environments — are not built.
+**Create mode is verified end to end** on real hardware. **Cover and edit are
+implemented and statically verified** — 261 tests, lint clean — but have not yet
+run on a GPU: the two transcription environments are built inside the image, and
+confirming them needs the container run described above.
 
 ## Licensing
 

@@ -12,7 +12,7 @@ nothing installed locally._
 |---|---|---|---|---|
 | 01 | research-and-decisions | Distill the researched YuE2/SheetSage2/Qwen3-ASR facts, dependency pins, VRAM budget, subprocess-isolation design, and licensing terms into stable factory reference material every later stage cites | `stages/01-research-and-decisions/output/` | COMPLETE |
 | 02 | create-mode-worker | Scaffold and implement the create-mode RunPod Serverless worker end-to-end per Roadmap Phase 1: handler, boot/model-caching, schema, storage, Dockerfile | `stages/02-create-mode-worker/output/` | COMPLETE |
-| 03 | cover-and-edit-modes | Extend the worker with cover and edit modes via mode routing and the subprocess-per-model-family isolation design per Roadmap Phase 2 | `stages/03-cover-and-edit-modes/output/` | empty |
+| 03 | cover-and-edit-modes | Extend the worker with cover and edit modes via mode routing and the subprocess-per-model-family isolation design per Roadmap Phase 2 | `stages/03-cover-and-edit-modes/output/` | COMPLETE |
 <!-- icm:sync:end -->
 
 ## Factory / product

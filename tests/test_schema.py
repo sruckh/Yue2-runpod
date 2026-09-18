@@ -14,6 +14,7 @@ from schema import (
     ValidationError,
     validate_job,
     validate_mode,
+    validate_mode_inputs,
 )
 
 VALID = {"style": "City Pop, upbeat", "lyrics": "[Verse]\nhello"}
@@ -176,15 +177,32 @@ def test_create_mode_accepted() -> None:
 
 
 @pytest.mark.parametrize("mode", ["cover", "edit"])
-def test_unimplemented_modes_named_explicitly(mode: str) -> None:
-    """Stage 03 modes fail with a different message than a typo would."""
-    with pytest.raises(ValidationError, match="Stage 03"):
-        validate_mode({"mode": mode})
+def test_all_three_modes_are_accepted(mode: str) -> None:
+    """Stage 03 added `cover` and `edit`. This test previously asserted they were
+    *rejected* as unimplemented, so it is inverted rather than deleted — the
+    vocabulary is still worth pinning."""
+    assert validate_mode({"mode": mode}) == mode
 
 
 def test_unknown_mode_rejected() -> None:
-    with pytest.raises(ValidationError, match="must be 'create'"):
+    with pytest.raises(ValidationError, match="must be one of"):
         validate_mode({"mode": "creat"})
+
+
+def test_cover_mode_requires_source_audio() -> None:
+    """Without a recording there is no cover, and YuE2 takes no audio argument."""
+    with pytest.raises(ValidationError, match="source_audio"):
+        validate_mode_inputs("cover", {"mode": "cover"})
+
+
+def test_cover_mode_accepts_source_audio() -> None:
+    validate_mode_inputs("cover", {"mode": "cover", "source_audio": "https://example.invalid/a.wav"})
+
+
+def test_other_modes_do_not_require_source_audio() -> None:
+    """The check is per-mode; `create` must not be asked for a recording."""
+    validate_mode_inputs("create", {"style": "x", "lyrics": "y"})
+    validate_mode_inputs("edit", {"style": "x", "lyrics": "y"})
 
 
 # --- echo shape --------------------------------------------------------------

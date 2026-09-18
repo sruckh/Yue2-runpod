@@ -35,6 +35,7 @@ import time
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -47,7 +48,18 @@ _CONFIG_CACHE.apply_hf_env()
 import runpod  # noqa: E402 - must follow apply_hf_env()
 
 import boot  # noqa: E402 - must follow apply_hf_env()
-from schema import MissingInputError, SongParameters, ValidationError, validate_job, validate_mode  # noqa: E402
+import modes  # noqa: E402
+from schema import (  # noqa: E402
+    COVER,
+    CREATE,
+    EDIT,
+    MissingInputError,
+    SongParameters,
+    ValidationError,
+    validate_job,
+    validate_mode,
+    validate_mode_inputs,
+)
 from storage import B2Storage, StorageError, job_prefix  # noqa: E402
 
 logging.basicConfig(
@@ -297,6 +309,39 @@ def build_response(
 # --- job entrypoint ----------------------------------------------------------
 
 
+def _fetch_source_audio(params: SongParameters, job_id: str) -> str:
+    """Download a cover job's source recording to the container's disk.
+
+    `source_audio` arrives as a URL (or a base64 payload) and the mode pipelines
+    need a local path. RunPod's own `download_files_from_urls` is used rather
+    than a hand-rolled fetch — it is what the reference workers use, and it
+    handles the base64 case, the job's scratch directory and cleanup.
+
+    Returns the local path. Raises `WorkerError` with a message the caller can
+    act on, because "the URL was wrong" is a caller problem, not a worker fault.
+    """
+    source = params.source_audio
+    if not source:
+        raise WorkerError("cover mode: no source_audio on the validated request")
+
+    if source.startswith("http://") or source.startswith("https://") or len(source) > 512:
+        try:
+            from runpod.serverless.utils import download_files_from_urls
+        except ImportError as exc:  # pragma: no cover - the image always has runpod
+            raise WorkerError("cover mode: runpod SDK is unavailable, so the source audio cannot be fetched") from exc
+        try:
+            # A data: URI is long; a URL is not. The SDK accepts both.
+            downloaded = download_files_from_urls(job_id, [source])
+        except Exception as exc:
+            raise WorkerError(f"cover mode: could not fetch source_audio — {exc}") from exc
+        if not downloaded:
+            raise WorkerError(f"cover mode: source_audio downloaded to nothing — {source[:120]}")
+        return str(downloaded[0])
+
+    # Already a path on disk.
+    return source
+
+
 def run_create_job(
     job: dict[str, Any], *, storage: Any | None = None, config: WorkerConfig | None = None
 ) -> dict[str, Any]:
@@ -309,10 +354,11 @@ def run_create_job(
     raw_input = job.get("input")
 
     try:
-        # Rejects `cover`/`edit` by name. Only `create` reaches the code below,
-        # so the result needs no further dispatch — the call is for its
-        # validation, and the assignment documents that.
-        _mode = validate_mode(raw_input)
+        mode = validate_mode(raw_input)
+        # Per-mode requirements, checked before the shared ones so a `cover`
+        # job missing its source fails with a message about that, not about a
+        # field it was never asked for.
+        validate_mode_inputs(mode, raw_input)
         params = validate_job(job)
     except MissingInputError as exc:
         log.warning("job %s rejected: %s", job_id, exc)
@@ -345,17 +391,49 @@ def run_create_job(
 
     try:
         _reset_dir(workdir)
+
+        # cover and edit both prepare a score before generation; `create` needs
+        # nothing. Doing this here — after the workdir exists but before the
+        # pipeline is touched — means a mode's own failure (a bad source file, a
+        # malformed score) surfaces without loading the model.
+        if mode != CREATE:
+            # A cover's recording arrives as a URL; the mode pipelines need a
+            # local file. Fetched here, before dispatch, so a bad URL fails
+            # before either transcription environment is started.
+            if mode == COVER:
+                params = replace(params, source_audio=_fetch_source_audio(params, job_id))
+            prepared = modes.dispatch(mode, params, workdir)
+            if prepared.score_abc is not None:
+                params = replace(params, abc=prepared.score_abc)
+            if prepared.lyrics is not None:
+                params = replace(params, lyrics=prepared.lyrics)
+            if mode == COVER:
+                # A cover is melody-conditioned by definition, and the melody
+                # just came from transcription. Overriding rather than trusting
+                # the caller's `cot` keeps the guarantee in one place.
+                params = replace(params, cot="melody")
+            elif mode == EDIT and prepared.score_abc is not None:
+                # An edit keeps the supplied harmony, which is what cot="full"
+                # means. See modes.prepare_edit.
+                params = replace(params, cot="full")
+            mode_stages = prepared.stages
+        else:
+            mode_stages = {}
+
         generation = generate(params, workdir, config)
         artifacts = bucket.upload_directory(workdir, job_prefix(job_id, params.id))
         # Built inside the `try`, and *before* cleanup: assembling the response
         # can fail, and a local-storage run returns `file://` URLs that would
         # point at files the `finally` had already deleted.
         response = build_response(params, artifacts, generation, config)
+        response["mode"] = mode
+        if mode_stages:
+            response["stages"] = mode_stages
     # `boot.BootError` and `BootFailedError` are included deliberately: a failed
     # model cache or a missing wheel is a job failure the caller should see as
     # `{"error": ...}`, not a traceback out of the handler. Omitting `BootError`
     # once meant a cold-start failure escaped as an unhandled exception.
-    except (WorkerError, StorageError, ConfigError, boot.BootError) as exc:
+    except (WorkerError, StorageError, ConfigError, boot.BootError, modes.ModeError) as exc:
         log.exception("job %s failed", job_id)
         return {"error": str(exc)}
     finally:

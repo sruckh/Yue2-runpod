@@ -70,18 +70,16 @@ def test_model_repos_named_in_docs_exist_as_constants() -> None:
     assert VAE_REPO.count("/") == 1
 
 
-def test_create_mode_is_the_only_mode_the_handler_accepts() -> None:
-    """Stage 02 is create-only.
+def test_all_three_modes_are_accepted_by_the_validator() -> None:
+    """Stage 02 was create-only; Stage 03 added cover and edit.
 
     Behavioural rather than textual: asserts what the validator *does*, not what
     a docstring says. An earlier version of this checked module docstrings for a
     keyword, which tested prose rather than behaviour and failed on modules that
     legitimately never mention the word.
     """
-    assert validate_mode({"mode": "create"}) == "create"
-    for unimplemented in ("cover", "edit"):
-        with pytest.raises(ValidationError, match="Stage 03"):
-            validate_mode({"mode": unimplemented})
+    for mode in ("create", "cover", "edit"):
+        assert validate_mode({"mode": mode}) == mode
 
 
 def test_env_example_documents_every_mandatory_variable() -> None:

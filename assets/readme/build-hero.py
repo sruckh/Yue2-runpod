@@ -87,12 +87,12 @@ add(f'<text x="64" y="198" font-family="{SANS}" font-size="50" font-weight="600"
 add(f'<text x="64" y="242" font-family="{SANS}" font-size="16" fill="{MUTED}">'
     "YuE2-3B plans the music as an ABC score first, then realizes it</text>")
 add(f'<text x="64" y="265" font-family="{SANS}" font-size="16" fill="{MUTED}">'
-    "as 48 kHz stereo audio. One request, one song, one GPU.</text>")
+    "as 48 kHz stereo audio. Create, cover, or edit a score.</text>")
 
 add(f'<line x1="64" y1="300" x2="560" y2="300" stroke="{RULE}" stroke-width="1"/>')
 
 add(f'<text x="64" y="330" font-family="{MONO}" font-size="12.5" fill="{MUTED}">'
-    "one request &#183; one song &#183; one GPU</text>")
+    "create &#183; cover &#183; edit &#183; one endpoint</text>")
 add(f'<text x="64" y="352" font-family="{MONO}" font-size="12.5" fill="{MUTED}">'
     "weights cached on the volume, never in the image</text>")
 add("</g>")

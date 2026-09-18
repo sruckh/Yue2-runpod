@@ -56,6 +56,49 @@ RUN pip install --no-cache-dir --upgrade "huggingface-hub==0.36.2" \
     && pip install --no-cache-dir --no-deps "/tmp/wheel/${YUE2_WHEEL}" \
     && rm -rf /tmp/wheel
 
+# --- isolated model-family environments (cover mode) --------------------------
+#
+# The cover path runs two more model families, and their dependencies cannot
+# coexist with YuE2's or with each other:
+#
+#   YuE2 (main, /app)  torch 2.10.0  transformers 4.57.6  numpy 2.2.6
+#   SheetSage2         torch 2.8.0   transformers 4.45.2  numpy 1.24.3
+#   Qwen3-ASR          torch (unpinned)  transformers 4.57.6  accelerate 1.12.0
+#
+# So each gets its own venv, invoked as a subprocess. The second reason is VRAM:
+# a subprocess exit returns its memory to the driver, which is what keeps a
+# cover job's peak at YuE2's own ceiling rather than the sum of three models.
+#
+# Built here, in the image, and nowhere else — never on a dev box.
+
+# SheetSage2 asks for Python 3.10 or 3.11; the base image carries 3.12, so its
+# venv is built on a 3.11 interpreter installed alongside.
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends python3.11 python3.11-venv \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG SHEETSAGE_REQUIREMENTS_URL=https://huggingface.co/m-a-p/SheetSage2/resolve/main/requirements.txt
+RUN python3.11 -m venv /opt/venvs/sheetsage2 \
+    && /opt/venvs/sheetsage2/bin/python -m pip install --no-cache-dir --upgrade pip \
+    && /opt/venvs/sheetsage2/bin/python -m pip install --no-cache-dir "huggingface-hub==0.36.0" \
+    && /opt/venvs/sheetsage2/bin/python -m pip install --no-cache-dir \
+         torch==2.8.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cu126 \
+    && curl -fsSL "${SHEETSAGE_REQUIREMENTS_URL}" -o /tmp/sheetsage-requirements.txt \
+    && /opt/venvs/sheetsage2/bin/python -m pip install --no-cache-dir -r /tmp/sheetsage-requirements.txt \
+    && rm -f /tmp/sheetsage-requirements.txt
+
+# Qwen3-ASR: the transformers backend, not vLLM. There is no concurrency need at
+# one-job-at-a-time, and the `vllm` extra would pull a second torch.
+RUN python -m venv /opt/venvs/qwen3-asr \
+    && /opt/venvs/qwen3-asr/bin/python -m pip install --no-cache-dir --upgrade pip \
+    && /opt/venvs/qwen3-asr/bin/python -m pip install --no-cache-dir "qwen-asr==0.0.6"
+
+# Each child environment must be able to import its own model library. This
+# fails the build rather than the first cover job, and it is the only check of
+# these environments that can run without a GPU.
+RUN /opt/venvs/sheetsage2/bin/python -c "import torch, transformers; print('sheetsage2', torch.__version__, transformers.__version__)" \
+    && /opt/venvs/qwen3-asr/bin/python -c "import torch, qwen_asr; print('qwen3-asr', torch.__version__)"
+
 # Handler code last — it changes most often, so it invalidates the least.
 COPY worker/ /app/
 
