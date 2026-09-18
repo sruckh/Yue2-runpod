@@ -397,7 +397,7 @@ def test_cover_fails_when_no_lyrics_are_available_at_all(fake_venv: Path, tmp_pa
         return {"status": "complete", "text": "   "}  # whitespace is not lyrics
 
     child(handler)
-    with pytest.raises(ModeError, match="no lyrics available"):
+    with pytest.raises(ModeError, match="returned no lyrics"):
         modes.prepare_cover(params(source_audio=str(source)), tmp_path)
 
 

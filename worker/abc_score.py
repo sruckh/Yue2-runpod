@@ -71,6 +71,7 @@ CHORD_RE = re.compile(
 #: it distinguishes a quoted chord from a quoted *header* value.
 TOKEN_RE = re.compile(
     r'"(?P<chord>[^"\n]*)"|'
+    r"\[K:(?P<key>[^\]\n]+)\]|"
     r"(?P<acc>\^\^|__|\^|_|=)?(?P<note>[A-Ga-gz])"
     r"(?P<oct>[,']*)(?P<duration>[0-9]*)(?P<tie>-?)"
 )
@@ -100,7 +101,18 @@ class AbcReport:
     """What a structural read of a score found."""
 
     voices: list[str] = field(default_factory=list)
+    #: Quoted tokens that parse as chord symbols.
     chords: list[str] = field(default_factory=list)
+    #: Quoted tokens that do **not** parse as chord symbols.
+    #:
+    #: In YuE2's native format a quoted token on a music line *is* chord
+    #: notation — there is no separate "text annotation" case, which is why
+    #: upstream treats an unparseable one as an error rather than ignoring it.
+    #: An earlier version of this module invented that exemption and silently
+    #: ignored them, so `"Cmaj9"` — a real chord outside the recognised quality
+    #: list — passed validation *and* survived chord stripping, reaching YuE2
+    #: with `cot="melody"` and producing something that was not a cover.
+    unrecognised_quoted: list[str] = field(default_factory=list)
     key: str | None = None
     meter: str | None = None
     unit: str | None = None
@@ -120,6 +132,7 @@ class AbcReport:
         return {
             "voices": self.voices,
             "chords": self.chords,
+            "unrecognised_quoted": self.unrecognised_quoted,
             "key": self.key,
             "meter": self.meter,
             "unit": self.unit,
@@ -203,10 +216,15 @@ def inspect(text: str) -> AbcReport:
         report.music_lines += 1
         for match in TOKEN_RE.finditer(line):
             chord = match.group("chord")
-            # A quoted value is a chord only if it *is* one; anything else in
-            # quotes on a music line is a text annotation, not harmony.
-            if chord is not None and CHORD_RE.fullmatch(chord.strip()):
+            if chord is None:
+                continue
+            # Every quoted token on a music line is chord notation. Those that do
+            # not match the grammar are recorded rather than ignored — see
+            # `unrecognised_quoted`.
+            if CHORD_RE.fullmatch(chord.strip()):
                 report.chords.append(chord)
+            elif chord.strip():
+                report.unrecognised_quoted.append(chord)
 
     return report
 
@@ -275,6 +293,20 @@ def validate_native(text: str, *, source: str = "score", require_melody_only: bo
     if report.tempo is None:
         raise AbcError(f"{source}: missing or malformed tempo; expected Q:1/4=<integer BPM>")
 
+    # Fail closed on any quoted token we do not recognise as a chord.
+    #
+    # This is upstream's policy and it is the right one: in this format a quoted
+    # token on a music line *is* chord notation, so one we cannot parse is either
+    # a chord we cannot handle or something the format does not allow. Ignoring
+    # it lets harmony through a path that assumes none — which is exactly what
+    # `"Cmaj9"` did before this check existed.
+    if report.unrecognised_quoted:
+        preview = ", ".join(repr(c) for c in report.unrecognised_quoted[:6])
+        raise AbcError(
+            f"{source}: unrecognised chord symbol(s) {preview}. Every quoted token on a music line is "
+            "a chord symbol; one that does not parse cannot be validated, stripped, or safely passed on."
+        )
+
     if require_melody_only and report.chords:
         preview = ", ".join(repr(c) for c in report.chords[:6])
         raise AbcError(
@@ -320,6 +352,14 @@ def strip_chords(text: str, *, source: str = "score") -> tuple[str, list[str]]:
     """
     report = inspect(text)
     if not report.chords:
+        if report.unrecognised_quoted:
+            # Refuse rather than pass it through: we do not know whether this is
+            # harmony, so we can neither remove it nor vouch for its absence.
+            preview = ", ".join(repr(c) for c in report.unrecognised_quoted[:6])
+            raise AbcError(
+                f"{source}: cannot strip unrecognised chord symbol(s) {preview} — "
+                "they may be harmony, and leaving them would silently change the result"
+            )
         return text, []
 
     before = _note_signature(text)

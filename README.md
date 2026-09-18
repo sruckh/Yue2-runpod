@@ -180,7 +180,7 @@ Anything inspecting the code uses `python -m py_compile`, never `import`.
 ## Current scope
 
 **Create mode is verified end to end** on real hardware. **Cover and edit are
-implemented and statically verified** — 261 tests, lint clean — but have not yet
+implemented and statically verified** — 281 tests, lint clean — but have not yet
 run on a GPU: the two transcription environments are built inside the image, and
 confirming them needs the container run described above.
 

@@ -9,7 +9,7 @@
 
 | Check | Result |
 |---|---|
-| Test suite | 261 passing (was 188) — no GPU, no network, no model libraries |
+| Test suite | 281 passing (was 188) — no GPU, no network, no model libraries |
 | Lint / format | clean |
 | `py_compile` | clean |
 | Import safety | asserted by test: no module in the worker process imports torch/transformers/qwen_asr |
@@ -25,7 +25,7 @@
 | `worker/transcribe_sheetsage/run.py` | Melody transcription, executed in the sheetsage2 venv |
 | `worker/transcribe_asr/run.py` | Lyric transcription, executed in the qwen3-asr venv |
 | `Dockerfile` | Builds both venvs into the image |
-| `tests/test_modes.py`, `tests/test_abc_score.py`, `tests/test_mode_wiring.py` | 73 new tests |
+| `tests/test_modes.py`, `tests/test_abc_score.py`, `tests/test_mode_wiring.py`, `tests/test_review_regressions_stage03.py` | 93 new tests |
 
 ## The bar, and what it found
 
@@ -103,6 +103,15 @@ is not a cover.
 | 10 | **The handler never fetched the recording from its URL**, so the mode received a URL where it needed a path | self-review |
 | 11 | **`lyrics` was unconditionally required**, which made every cover job impossible: a cover's words come from transcription | self-review |
 | 12 | A child exiting non-zero without a `result.json` reported only the exit code | test |
+| 13 | **Chord detection failed open.** Any quoted token matching a *closed* quality list counted as a chord; `"Cmaj9"`, `"Chorus"`, `"N.C."` fell through an invented "text annotation" exemption. `"Cmaj9"` is real harmony — it passed validation **and** survived `strip_chords`, reaching YuE2 with `cot="melody"` | critic, executed against upstream |
+| 14 | **The `require_melody_only` check was unreachable** — `strip_chords` ran first and already guarantees chord-freedom, so the flag could never fire at its only call site | critic |
+| 15 | ASR ran unconditionally and its failure was fatal *before* consulting `lyrics_supplied` — supplying lyrics bought nothing | critic |
+| 16 | `offline` was never sent to either child, so `local_files_only` was always `False` and a child could re-download what the endpoint had cached | critic |
+| 17 | `scratch_dir` used `rmtree(ignore_errors=True)` then `mkdir(exist_ok=True)`: a failed removal left the directory intact, and the next stage reported the *previous* run's artifacts as its own | critic |
+| 18 | Entrypoints were never `.resolve()`d — worked only because Python absolutises `__file__` | critic |
+| 19 | `HOME` was dropped from the child environment, so the HF libraries lost `~/.cache` and `~/.netrc` | critic |
+| 20 | `[K:...]` inline key changes were missing from `TOKEN_RE`; `_note_signature` produced a spurious note from one | critic, executed |
+| 21 | `if params.abc:` treated an empty score as "no score", silently planning instead of failing | critic |
 
 Defects 2, 8, 9, 10 and 11 are the instructive ones, and they split into two
 kinds.
@@ -127,6 +136,34 @@ never used by the mode fails a test rather than a customer's job.
 They were also found *late* — after the suite was green at 248 tests. A green
 suite that never exercises the seam between two tested components is not
 evidence about the seam.
+
+**Defects 13–21 came from an independent critic that executed both
+implementations rather than reading them.** Defect 13 is the one that matters:
+it defeated the exact guarantee this stage describes as load-bearing, and it did
+so by *inventing an exemption* — "anything else in quotes is a text annotation".
+In YuE2's native format a quoted token on a music line **is** chord notation;
+there is no annotation case. The lesson generalises: **a validator that ignores
+what it does not understand is not a validator, and the thing it lets through is
+exactly the thing it was written to stop.**
+
+The fix is upstream's policy — fail closed on any quoted token that does not
+parse — plus running inspection *before* stripping so the melody-only check can
+actually fail.
+
+Defect 14 is the same family as defects 8–11 from a different angle: a check
+that exists but cannot fire. It looked like protection and was decoration.
+
+### Where the critic and the builder disagreed
+
+Two of the critic's own flags resolved in the code's favour, and it was right to
+mark them unverifiable rather than assert them:
+
+- `schema.SongParameters` was outside its corpus, so it could not confirm
+  `lyrics_supplied` existed. It does, and `tests/test_mode_wiring.py` now proves
+  the wire end to end.
+- It noted our child writes `result.json` where upstream writes `failure.json`.
+  That is a difference in convention, not a defect: our parent reads one file for
+  both outcomes, which is simpler and is what the tests pin.
 
 ## What this stage does **not** prove
 

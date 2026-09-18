@@ -159,53 +159,81 @@ def prepare_cover(params: SongParameters, workdir: Path) -> ModeResult:
         raise ModeError("cover mode: SheetSage2 reported success but returned no ABC")
 
     # The subprocess is supposed to return melody-only ABC. Verify rather than
-    # trust: YuE2's cot="melody" does not strip chords, so an unclean melody
-    # would generate something that is not a cover, and silently.
+    # trust, and in this order:
+    #
+    #   1. Inspect. A quoted token that is not a valid chord is a hard error —
+    #      we cannot tell whether it is harmony, so we can neither strip it nor
+    #      pass it on. This is the check that actually protects the guarantee.
+    #   2. Strip recognised chords. Their presence means the model ignored
+    #      melody_only; upstream raises here, but a stripped melody still
+    #      produces the cover that was asked for. The fact is recorded.
+    #   3. Validate melody-only *after* stripping, which is now a real assertion
+    #      rather than a restatement of step 1.
+    #
+    # Validating before stripping, as an earlier version did, made step 3
+    # unreachable: strip_chords had already guaranteed chord-freedom.
     try:
-        melody_abc, removed = abc_score.strip_chords(melody_abc, source="SheetSage2 melody")
+        report = abc_score.inspect(melody_abc)
     except abc_score.AbcError as exc:
-        raise ModeError(f"cover mode: {exc}") from exc
-    if removed:
-        log.warning("cover mode: stripped %d chord symbols the transcriber left in", len(removed))
-        stages["sheetsage"]["chords_stripped"] = removed
+        raise ModeError(f"cover mode: transcribed melody is not usable — {exc}") from exc
+
+    if report.unrecognised_quoted:
+        preview = ", ".join(repr(c) for c in report.unrecognised_quoted[:6])
+        raise ModeError(
+            f"cover mode: SheetSage2 returned unrecognised chord symbol(s) {preview}. "
+            "They may be harmony we cannot remove, which would make this something other than a cover."
+        )
 
     try:
+        melody_abc, removed = abc_score.strip_chords(melody_abc, source="SheetSage2 melody")
         abc_score.validate_native(melody_abc, source="SheetSage2 melody", require_melody_only=True)
     except abc_score.AbcError as exc:
         raise ModeError(f"cover mode: transcribed melody is not usable — {exc}") from exc
 
+    if removed:
+        # Recorded, not just logged: it means the model ignored melody_only, and
+        # that is worth being able to see in the job's response.
+        log.warning("cover mode: stripped %d chord symbols the transcriber left in", len(removed))
+        stages["sheetsage"]["chords_stripped"] = removed
+
     # --- stage 2: lyrics, in Qwen3-ASR's own environment ----------------------
+    #
+    # A caller may supply their own lyrics — the upstream reference says to
+    # "obtain or check the lyrics separately", and a listener knows them better
+    # than an ASR pass over a full mix does. When they have, the transcription is
+    # a convenience rather than a requirement: it still runs (it fills
+    # lyrics.txt for the record), but its failure must not fail the job.
+    #
+    # An earlier version ran ASR unconditionally and raised on any failure
+    # *before* consulting the flag, so supplying lyrics bought nothing and a
+    # flaky transcription killed a job that already had everything it needed.
     asr_dir = scratch_dir(workdir, "asr")
-    write_request(asr_dir, {"audio": str(source), "language": None})
+    write_request(asr_dir, {"audio": str(source), "language": None, "offline": True})
     asr = run_stage(
         ASR_VENV,
         ASR_ENTRYPOINT,
         asr_dir,
         timeout_seconds=ASR_TIMEOUT_SECONDS,
         name="Qwen3-ASR",
+        required=not params.lyrics_supplied,
     )
     stages["asr"] = {
         "ok": asr.ok,
         "seconds": round(asr.elapsed_seconds, 2),
         "error": asr.error,
+        "used": not params.lyrics_supplied,
+        "reason": "caller supplied lyrics" if params.lyrics_supplied else "transcribed",
     }
-    if not asr.ok:
-        raise ModeError(f"cover mode: lyric transcription failed — {asr.error}")
 
-    # A caller may supply their own lyrics — the upstream reference says to
-    # "obtain or check the lyrics separately", and a listener often knows them
-    # better than an ASR pass over a full mix does.
-    transcribed = str(asr.payload.get("text") or "").strip()
     if params.lyrics_supplied:
         lyrics = params.lyrics
-        log.info("cover mode: using caller-supplied lyrics, not the transcription")
-        stages["asr"]["used"] = False
+        log.info("cover mode: using caller-supplied lyrics (ASR ok=%s, advisory only)", asr.ok)
     else:
-        lyrics = transcribed
-        stages["asr"]["used"] = True
-
-    if not lyrics:
-        raise ModeError("cover mode: no lyrics available — Qwen3-ASR returned nothing and no 'lyrics' was supplied")
+        if not asr.ok:
+            raise ModeError(f"cover mode: lyric transcription failed — {asr.error}")
+        lyrics = str(asr.payload.get("text") or "").strip()
+        if not lyrics:
+            raise ModeError("cover mode: Qwen3-ASR returned no lyrics and none were supplied")
 
     log.info("cover mode: melody %d chars, lyrics %d chars", len(melody_abc), len(lyrics))
     return ModeResult(mode=COVER, score_abc=melody_abc, lyrics=lyrics, stages=stages)
@@ -225,7 +253,10 @@ def prepare_edit(params: SongParameters, workdir: Path) -> ModeResult:
     Note that editing re-renders the whole song. YuE2 does not preserve the
     waveform outside the edited region, which callers routinely assume it does.
     """
-    if params.abc:
+    # `is not None`, not truthiness: `""` is a caller sending an empty score,
+    # which validation rejects — while `None` is a caller asking for a plan. The
+    # difference is a typo versus a request.
+    if params.abc is not None:
         try:
             report = abc_score.validate_native(params.abc, source="edited score")
         except abc_score.AbcError as exc:

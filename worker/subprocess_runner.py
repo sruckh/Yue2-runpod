@@ -49,10 +49,25 @@ log = logging.getLogger(__name__)
 #: Where each model family's virtual environment lives in the image.
 VENV_ROOT = Path(os.environ.get("YUE2_VENV_ROOT", "/opt/venvs"))
 
-#: Environment passed to a child. Deliberately minimal: inheriting the parent's
+#: Environment passed to a child. Deliberately narrow: inheriting the parent's
 #: `PYTHONPATH` would let the child import this worker's modules against a
 #: different torch, which is the exact confusion the boundary exists to prevent.
-_INHERITED_ENV = ("HF_HOME", "HF_HUB_CACHE", "HF_XET_CACHE", "HF_TOKEN", "HF_HUB_OFFLINE", "CUDA_VISIBLE_DEVICES")
+#:
+#: `HOME` is included because the HuggingFace libraries consult `~/.cache` and
+#: `~/.netrc`; without it they log errors and, in some versions, fall back to a
+#: read-only location. `TRANSFORMERS_OFFLINE` and `XDG_CACHE_HOME` are included
+#: for the same reason — the child should see the same cache the parent does.
+_INHERITED_ENV = (
+    "HF_HOME",
+    "HF_HUB_CACHE",
+    "HF_XET_CACHE",
+    "HF_TOKEN",
+    "HF_HUB_OFFLINE",
+    "TRANSFORMERS_OFFLINE",
+    "XDG_CACHE_HOME",
+    "HOME",
+    "CUDA_VISIBLE_DEVICES",
+)
 
 
 class SubprocessError(RuntimeError):
@@ -90,8 +105,14 @@ def run_stage(
     *,
     timeout_seconds: int,
     name: str | None = None,
+    required: bool = True,
 ) -> SubprocessResult:
     """Run one isolated stage to completion.
+
+    `required=False` marks a stage whose failure is advisory — the caller has
+    another source for its output and will decide. It changes nothing about how
+    the stage runs; it only records the intent in the log, so an operator reading
+    a job's story can tell a tolerated failure from a fatal one.
 
     `workdir` is the contract between parent and child: the parent has already
     written `request.json` into it, and the child writes `result.json` and its
@@ -158,7 +179,10 @@ def run_stage(
     artifacts = {
         str(p.relative_to(workdir)): p for p in sorted(workdir.rglob("*")) if p.is_file() and p.name != "request.json"
     }
-    log.info("%s: %s in %.1fs (%d artifacts)", name, "ok" if ok else "failed", elapsed, len(artifacts))
+    if not ok and not required:
+        log.warning("%s: failed after %.1fs — advisory, the caller supplied a fallback", name, elapsed)
+    else:
+        log.info("%s: %s in %.1fs (%d artifacts)", name, "ok" if ok else "failed", elapsed, len(artifacts))
 
     return SubprocessResult(
         name=name,
@@ -208,9 +232,24 @@ def _tail(text: str | bytes | None, limit: int = 2000) -> str:
 
 
 def scratch_dir(root: Path, label: str) -> Path:
-    """A fresh directory for one stage. Never reused, so artifacts cannot mix."""
+    """A fresh directory for one stage, guaranteed empty.
+
+    `ignore_errors=True` on the removal was a bug: if `rmtree` failed, the
+    directory survived, `mkdir(exist_ok=True)` succeeded, and the next stage's
+    artifact sweep reported the *previous* run's `score.abc` and `lyrics.txt` as
+    this run's output. Silent, and exactly the kind of wrongness that looks like
+    success. A directory that cannot be emptied is now a hard error.
+    """
     path = root / label
     if path.exists():
-        shutil.rmtree(path, ignore_errors=True)
+        try:
+            shutil.rmtree(path)
+        except OSError as exc:
+            raise SubprocessError(
+                f"could not clear {path} before this stage: {exc}. Refusing to run in a directory that "
+                "may hold a previous run's artifacts."
+            ) from exc
     path.mkdir(parents=True, exist_ok=True)
+    if any(path.iterdir()):
+        raise SubprocessError(f"{path} is not empty after clearing; refusing to mix runs")
     return path
