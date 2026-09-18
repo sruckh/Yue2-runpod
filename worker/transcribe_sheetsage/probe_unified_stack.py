@@ -185,12 +185,28 @@ def probe_sheetsage2(repo_id: str, offline: bool) -> ProbeOutcome:
         tokenizer_module = importlib.import_module(f"{package_name}.tokenization_sheetsage2")
         has_tokenizer = getattr(tokenizer_module, "SheetSage2Tokenizer", None) is not None
 
-        return True, (
+        return ProbeOutcome(
+            True,
+            "ok",
             f"config {kind}; SheetSage2Model and "
-            f"{'SheetSage2Tokenizer' if has_tokenizer else 'tokenizer (absent)'} imported"
+            f"{'SheetSage2Tokenizer' if has_tokenizer else 'tokenizer (absent)'} imported",
         )
+    except ModuleNotFoundError as exc:
+        # A distribution that is not installed, not a version that conflicts.
+        # The two print identically and mean opposite things, which is the
+        # distinction this class exists for: the third real run of this probe
+        # reported `ModuleNotFoundError: No module named 'torchaudio'` as a
+        # verdict, and torchaudio simply was not installed in that environment.
+        #
+        # Residual risk: a submodule that moved *inside* an installed
+        # distribution also raises ModuleNotFoundError, and would be called
+        # "missing" here. `probe_imports` checks those paths separately and the
+        # verdict is the conjunction of the two, so a moved internal surfaces as
+        # INCONCLUSIVE rather than as a false "do not unify". The detail line
+        # carries the missing name so a reader can tell which it was.
+        return ProbeOutcome(False, "missing", f"{type(exc).__name__}: {exc}")
     except BaseException as exc:
-        return False, f"{type(exc).__name__}: {exc}\n{traceback.format_exc(limit=4)}"
+        return ProbeOutcome(False, "structural", f"{type(exc).__name__}: {exc}\n{traceback.format_exc(limit=4)}")
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -1,8 +1,7 @@
 """Tests for the unification probe's own correctness.
 
-The probe exists to answer one question empirically, and its first run answered
-it **wrongly** — reporting "the unified stack is not viable" for two reasons that
-were both bugs in the probe:
+The probe exists to answer one question empirically, and it has now failed to
+answer it in four different ways — every one of them a bug in the probe:
 
 1. It listed `transformers.models.bart.modeling_bart.BartDecoder` as a module and
    handed it to `importlib.import_module`, which takes a *module*. `BartDecoder`
@@ -10,10 +9,17 @@ were both bugs in the probe:
    package` in every environment at every version — a permanent false negative.
 2. The Dockerfile ran it with `--offline` in an image where nothing is cached, so
    it could never fetch SheetSage2's code at all.
+3. With those fixed it ran, and reported a missing `torchaudio` as "the stacks
+   are incompatible" — a stronger claim than the evidence, since torchaudio was
+   simply not installed and 2.10.0 ships for cu128/cp311.
+4. With torchaudio installed it finally fetched the code and crashed on its own
+   success path: `AttributeError: 'tuple' object has no attribute 'ok'`.
 
-Both produced the same printed verdict, and it was not evidence about anything.
-These tests pin the properties that make the probe's answer meaningful, because
-a probe that lies is worse than no probe: it converts "unknown" into "no".
+Runs 1-3 all printed the same verdict, and none of them was evidence about
+anything. A probe that lies is worse than no probe: it converts "unknown" into
+"no", and the answer looks settled. These tests pin the properties that make the
+probe's answer meaningful, and — after run 4 — the property that makes it able to
+produce an answer at all.
 """
 
 from __future__ import annotations
@@ -22,6 +28,7 @@ import ast
 import importlib.util
 import re
 import sys
+import types
 from pathlib import Path
 
 import check_env
@@ -55,6 +62,132 @@ def probe_module():
         raise
     yield module
     sys.modules.pop("probe_unified_stack", None)
+
+
+# =============================================================================
+# Every exit from probe_sheetsage2 returns a ProbeOutcome
+# =============================================================================
+#
+# The fourth bug, and the one that got furthest: with the module-path and
+# `--offline` bugs fixed, and torchaudio installed, the probe finally *fetched
+# SheetSage2's code* — and then crashed on its own success path:
+#
+#     print(f"  {'ok  ' if outcome.ok else 'FAIL'} ...")
+#     AttributeError: 'tuple' object has no attribute 'ok'
+#
+# `probe_sheetsage2` returned a bare 2-tuple at two of its five exits (the
+# success path and the catch-all) and a `ProbeOutcome` at the other three. The
+# earlier tests *mocked* the function, so they replaced both broken exits with
+# well-formed values and never executed them. A mock of the thing under test
+# cannot find a bug in the thing under test.
+#
+# These tests read the real function and drive the real paths.
+
+
+def test_every_return_in_probe_sheetsage2_is_a_probe_outcome() -> None:
+    """Statically: every `return` in the body must construct a ProbeOutcome.
+
+    This is the check that would have caught it before the build. A tuple and a
+    dataclass are indistinguishable at the call site until something reads an
+    attribute, so the *shape* of the return statements is what has to be pinned.
+    """
+    tree = ast.parse(PROBE.read_text(encoding="utf-8"))
+    function = next(
+        node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "probe_sheetsage2"
+    )
+    returns = [node for node in ast.walk(function) if isinstance(node, ast.Return)]
+    assert returns, "probe_sheetsage2 has no return statements — did it get renamed?"
+
+    for node in returns:
+        value = node.value
+        assert value is not None, f"line {node.lineno}: a bare `return` — the caller needs an outcome"
+        # `return ProbeOutcome(...)` — a call to the dataclass by name.
+        is_outcome = (
+            isinstance(value, ast.Call) and isinstance(value.func, ast.Name) and value.func.id == "ProbeOutcome"
+        )
+        assert is_outcome, (
+            f"line {node.lineno}: returns {ast.unparse(value)[:70]!r}, not a ProbeOutcome. "
+            "A bare tuple works until the caller reads `.ok`, and then the probe dies "
+            "without a verdict — which is what happened in the build."
+        )
+
+
+def test_the_success_path_returns_an_outcome_not_a_tuple(probe_module, monkeypatch) -> None:
+    """Execute the real success path end-to-end against a synthetic package.
+
+    The static check above pins the shape; this one proves the path actually
+    runs and produces something main() can read. It builds a throwaway package
+    on disk whose `__init__.py` imports cleanly, so `exec_module` succeeds and
+    control reaches the `return ProbeOutcome(True, ...)` line.
+    """
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        package = root / "pkg"
+        package.mkdir()
+        (package / "__init__.py").write_text("", encoding="utf-8")
+
+        # The probe loads `<path>/__init__.py` as a package. Stand in for the
+        # downloaded snapshot with this directory.
+        monkeypatch.setitem(
+            sys.modules, "huggingface_hub", types.SimpleNamespace(snapshot_download=lambda *a, **k: root)
+        )
+        # AutoConfig would need the real config; stub it so the class name is
+        # deterministic and the import path is reached.
+        fake_config = type("SheetSage2Config", (), {})
+        fake_transformers = types.SimpleNamespace(
+            AutoConfig=types.SimpleNamespace(from_pretrained=lambda *a, **k: fake_config())
+        )
+        monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+
+        outcome = probe_module.probe_sheetsage2("synthetic/repo", offline=False)
+
+    assert isinstance(outcome, probe_module.ProbeOutcome), (
+        f"probe_sheetsage2 returned {type(outcome).__name__} on its success path, "
+        "so main() will raise AttributeError instead of printing a verdict"
+    )
+    # The model/tokenizer modules do not exist in the synthetic package, so this
+    # lands in the catch-all — which is the *other* path that returned a tuple.
+    if outcome.ok:
+        assert outcome.kind == "ok"
+    else:
+        assert outcome.kind in {"missing", "structural", "fetch"}
+        assert outcome.detail
+
+
+def test_the_probe_runs_to_a_verdict_rather_than_crashing(probe_module, capsys, monkeypatch) -> None:
+    """main() must print a verdict for every outcome the real code can return.
+
+    The crash was in `main`, reading `.ok` off a tuple. Driving main() with the
+    real function (not a mock of it) is what makes this test able to fail.
+    """
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        package = root / "pkg"
+        package.mkdir()
+        (package / "__init__.py").write_text("", encoding="utf-8")
+        monkeypatch.setitem(
+            sys.modules, "huggingface_hub", types.SimpleNamespace(snapshot_download=lambda *a, **k: root)
+        )
+        fake_config = type("SheetSage2Config", (), {})
+        monkeypatch.setitem(
+            sys.modules,
+            "transformers",
+            types.SimpleNamespace(AutoConfig=types.SimpleNamespace(from_pretrained=lambda *a, **k: fake_config())),
+        )
+        monkeypatch.setattr(probe_module, "probe_imports", lambda: [("synthetic", True, "")])
+        monkeypatch.setattr(probe_module, "versions", lambda: {})
+
+        code = probe_module.main([])
+
+    out = capsys.readouterr().out
+    assert "VERDICT" in out, out
+    assert code in (0, 1)
+    # And it did not die partway with a traceback.
+    assert "AttributeError" not in out
 
 
 # =============================================================================
