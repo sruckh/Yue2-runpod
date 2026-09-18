@@ -1,7 +1,20 @@
-# YuE2 create-mode RunPod Serverless worker.
+# YuE2 RunPod Serverless worker — create, cover and edit modes.
 #
-# Shape follows the Phase 1 contract in `shared/worker-shape.md`:
-#   python:3.12-slim + libsndfile1, wheel pulled from the HF repo at build time.
+# Base image: `python:3.11-slim-trixie`, deliberately.
+#
+#   3.11, not 3.12, because cover mode's SheetSage2 environment pins
+#   numpy==1.24.3, which predates Python 3.12 and publishes no cp312 wheels —
+#   see worker/transcribe_sheetsage/requirements.txt. Every pin YuE2 needs has
+#   cp311 wheels (torch 2.10.0 on both cu128 and cu126, triton 3.6.0,
+#   tiktoken 0.12.0, numpy 2.2.6), so one interpreter serves all three
+#   environments.
+#
+#   `-trixie` is pinned explicitly because the bare `python:3.11-slim` tag is a
+#   moving target. It moved once already: `python:3.12-slim` resolved to Debian
+#   trixie, which dropped the `python3.11` apt package, and a build that tried
+#   to install it there failed. Naming the Debian release makes the base
+#   reproducible.
+#
 # No weights, no vLLM, no flash-attn compile step.
 #
 # On flash-attn specifically: the YuE2 model card says the HF package "uses
@@ -12,7 +25,7 @@
 # not install. The HF path goes through PyTorch's own SDPA. That is why the
 # slim base is sufficient and why there is no multi-hour attention build here.
 
-FROM python:3.12-slim
+FROM python:3.11-slim-trixie
 
 # libsndfile1 is a hard runtime dependency of `soundfile`, which the pipeline
 # uses to write the 48 kHz FLAC. Without it `import soundfile` raises at import
@@ -69,21 +82,30 @@ RUN pip install --no-cache-dir --upgrade "huggingface-hub==0.36.2" \
 # a subprocess exit returns its memory to the driver, which is what keeps a
 # cover job's peak at YuE2's own ceiling rather than the sum of three models.
 #
+# All three are Python 3.11 — the base interpreter — because that is what
+# SheetSage2's numpy pin requires. The isolation is about torch/numpy versions,
+# not about the interpreter.
+#
 # Built here, in the image, and nowhere else — never on a dev box.
 
-# SheetSage2 asks for Python 3.10 or 3.11; the base image carries 3.12, so its
-# venv is built on a 3.11 interpreter installed alongside.
-RUN apt-get update \
-    && apt-get install --yes --no-install-recommends python3.11 python3.11-venv \
-    && rm -rf /var/lib/apt/lists/*
+# Requirements are vendored in the repository, not fetched from a URL at build
+# time: a fetched file makes the image depend on whatever is served that day.
+COPY worker/transcribe_sheetsage/requirements.txt /tmp/sheetsage-requirements.txt
 
-ARG SHEETSAGE_REQUIREMENTS_URL=https://huggingface.co/m-a-p/SheetSage2/resolve/main/requirements.txt
-RUN python3.11 -m venv /opt/venvs/sheetsage2 \
+# torch comes from the CUDA 12.6 index, and goes in *before* the requirements
+# file. That file pins `torch==2.8.0` with no index, so letting it resolve from
+# PyPI would install the CPU-only build. Installed here first, those pins are
+# already satisfied and pip skips them.
+#
+# NOTE: no comments inside the RUN chain below. Docker joins continued lines into
+# one shell command *before* running it, so a `#` mid-chain comments out
+# everything after it — including the following `&&`. Keeping the explanation out
+# here is correctness, not style.
+RUN python -m venv /opt/venvs/sheetsage2 \
     && /opt/venvs/sheetsage2/bin/python -m pip install --no-cache-dir --upgrade pip \
     && /opt/venvs/sheetsage2/bin/python -m pip install --no-cache-dir "huggingface-hub==0.36.0" \
     && /opt/venvs/sheetsage2/bin/python -m pip install --no-cache-dir \
          torch==2.8.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cu126 \
-    && curl -fsSL "${SHEETSAGE_REQUIREMENTS_URL}" -o /tmp/sheetsage-requirements.txt \
     && /opt/venvs/sheetsage2/bin/python -m pip install --no-cache-dir -r /tmp/sheetsage-requirements.txt \
     && rm -f /tmp/sheetsage-requirements.txt
 
