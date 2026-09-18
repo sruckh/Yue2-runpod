@@ -207,3 +207,53 @@ endpoint setting, not a code change.
 
 Once B2 credentials are on the endpoint, the full chain runs: generate → persist
 artifacts → upload → presigned URLs. That is the stage's Human check.
+
+---
+
+## Production verification — Human check PASSED
+
+**The stage's `## Human check` is satisfied.** One `create` job ran end to end on
+a real 4090: submitted, polled, and the returned artifacts downloaded and
+inspected.
+
+| Check | Result |
+|---|---|
+| Job status | `COMPLETED` |
+| Generation | 51.12 s of audio in **29.7 s** (≈1.7× faster than real time) |
+| `audio.flac` | **FLAC, 24-bit, stereo, 48 kHz**, 10.5 MB, 2,453,696 samples |
+| Duration arithmetic | 2453696 / 48000 = **51.119 s** — matches the reported `duration` exactly |
+| `score.abc` | Valid ABC: `M:4/4`, `Q:1/4=118`, `K:Dm`, two voices (`Vocal`, `Ins`), 189 note tokens, sections marked `% intro` / `% verse` |
+| Chord symbols | `Gm7`, `C7`, `Am7`, `Dm7` — proof `cot="full"` did melody **and** chord planning |
+| Audio content | 8.00 bits/byte entropy, 0.71 compression ratio — real signal, not silence |
+| Artifacts | 11, all under one job-scoped prefix |
+| Egress | presigned B2 URLs, 7-day expiry — **URLs, not bytes**, per locked decision 5 |
+
+### The four review fixes, confirmed in production
+
+Each of these was a defect found by an independent critic against a green test
+suite. All four are now verified against real traffic rather than a test double:
+
+1. **`truncated` is a dict.** The response reports `truncated: false` with
+   `truncation_by_stage: {abc: false, semantic: false}`. The old `bool({...})`
+   would have reported **every successful song as truncated** — invisible here,
+   because the job succeeded.
+2. **`decoder` names what actually ran** — `m-a-p/YuE2-Vae`, from config, not
+   from the invented `YUE2_VAE` env var that nothing read.
+3. **Boot ran before the first job.** `load.resolve_and_integrity_seconds: 14.04`
+   appears in the per-job timings as an *already-resolved* model. Had boot been
+   lazy, that 14 s plus a weight download would have landed inside this job's
+   timeout.
+4. **Fail-fast ordering.** Earlier production runs rejected misconfigured jobs in
+   ~250 ms with no GPU time; that is the same ordering that kept this job from
+   wasting a generation on an undeliverable song.
+
+### Notes from the real run
+
+- `attention: "flash"` in the timings is **PyTorch's built-in SDPA flash kernel**,
+  not the `flash-attn` package. This confirms the earlier finding that the slim
+  base image needs no attention build step — the image built and ran without one.
+- `load.mot_load_seconds: 0.3` versus `resolve_and_integrity_seconds: 14.0`:
+  resolution and hash verification dominate the load, and a warm cache skips the
+  download entirely.
+
+Full evidence and the earlier error-path runs: **`review-findings.md`**.

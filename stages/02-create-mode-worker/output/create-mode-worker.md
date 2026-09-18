@@ -6,8 +6,8 @@
 
 ## Status
 
-**Build complete, verified as far as this machine allows.**
-Awaiting the stage's `## Human check`, which needs a GPU.
+**COMPLETE.** The Human check has been passed on real hardware — see
+Production verification below.
 
 | Check | Result |
 |---|---|
@@ -92,65 +92,37 @@ changed the build:
 
 ## Defects found and fixed
 
-Eleven total. Six were caught during the build by running something; five were
-caught afterwards by independent critics — including two that produced a
-**successful response containing a false statement**, which no amount of green
-tests would have surfaced.
+Thirteen, in three groups. Six were caught during the build; five by independent
+critics after a green 146-test suite; one was caused by the fix for another; one
+by a rebuild. Two were **silent** — a successful response containing a false
+statement — and are the reason this stage's review was worth its cost.
 
-| # | Defect | Found by | Fix |
-|---|---|---|---|
-| 1 | Every real job failed at upload — `WorkerConfig(cache=...)` left storage unset | test | `WorkerConfig.autoload()` |
-| 2 | `seed: true` silently became seed 1 (bools are ints) | test | reject before coercion |
-| 3 | Boot failure escaped as a traceback instead of a structured error | smoke run | `BootError` added to the catch |
-| 4 | Object keys flattened; `..` survived sanitisation | test | per-segment `_safe_segment` |
-| 5 | `HF_XET_CACHE` used `setdefault`, so the bulk of a cold-start download could land on the container disk | test | assigned, not defaulted |
-| 6 | Storage resolved *after* generation — a bad bucket cost 70 s of GPU before failing | self-review | resolve storage before generating |
-| 7 | Boot was lazy despite its docstring; a ~12 GB download ran inside the first job's timeout, and every later job retried it | arch critic | `boot_worker()` at import + a circuit breaker |
-| 8 | `build_response()` outside the `try`, so the documented `--test_input` path crashed | arch critic | moved inside the `try` |
-| 9 | Cleanup ran before response assembly — local runs returned `file://` URLs to deleted files | arch critic | response built before cleanup |
-| 10 | Workdir keyed on the caller-supplied `id` alone — two same-id jobs destroyed each other's artifacts (silent corruption) | arch critic | per-invocation `uuid4` suffix |
-| 11 | **`truncated` is a dict** — `bool({...})` is always `True`, so every successful song was reported truncated | API critic | `_normalise_truncation()` |
-| 12 | **`YUE2_VAE` was invented** — zero hits in the package; the `decoder` field reported a name that changed nothing | API critic | `YUE2_VAE_REPO`, honoured via `vae=` |
-| 13 | **The fix for #7 broke the image.** Moving boot to module import made the Dockerfile's `import handler` smoke test hydrate the volume inside a build layer, baking ~12 GB of weights into the image — directly against locked decision 4 | builder, on rebuild | boot moved to `main()`; Dockerfile now fails the build if any `*.safetensors` is present |
+| Group | Examples | Lesson carried into `worker/AGENTS.md` |
+|---|---|---|
+| Build-time | storage unset on every real job; `seed: true` silently becoming 1; boot failures escaping as tracebacks | run it, don't read it |
+| Adversarial review | `truncated` is a dict, so `bool()` reported **every** song as truncated; `YUE2_VAE` was invented and reported as provenance; boot was lazy despite its docstring | check *semantics*, not just that a name exists |
+| Self-inflicted | the boot fix baked 12 GB of weights into the image; a Dockerfile `HF_HOME` was wrong and unnoticed | enforce rules in the build, not by convention |
 
-Defects 11 and 12 are the instructive ones: both are silent, both shipped through
-a green suite, and both were missed by a builder-run verification that checked
-*shape* rather than *semantics*.
+Per-defect detail: **`review-findings.md`**.
 
-Defect 13 is a different kind of instructive: **the fix for one defect created
-another**, and only a rebuild could reveal it. The first two images built during
-this stage were 12.9 GB and correct; the third silently became a 24 GB image with
-the model weights inside it. Nothing in the test suite could have caught that —
-it is a property of the *build*, not the code — which is why the Dockerfile now
-asserts it directly rather than trusting a reviewer to notice.
+## Production verification — Human check PASSED
 
-Full analysis, per-defect reasoning, and a correction to the comparison harness:
-**`review-findings.md`**.
+One `create` job ran end to end on a real 4090 and the artifacts were downloaded
+and inspected. **The stage's Human check is satisfied.**
 
-### The image-build guard
+| Check | Result |
+|---|---|
+| Status | `COMPLETED` — 51.12 s of audio in 29.7 s |
+| `audio.flac` | FLAC, 24-bit, stereo, 48 kHz — 2,453,696 samples = 51.119 s, matching the reported duration exactly |
+| `score.abc` | Valid ABC, `K:Dm`, 118 bpm, two voices, chord symbols present (so `cot="full"` planned melody *and* harmony) |
+| Audio | 8.00 bits/byte entropy — real signal, not silence |
+| Egress | 11 artifacts, presigned B2 URLs with 7-day expiry — URLs, not bytes |
 
-`worker/Dockerfile` now fails the build if any `*.safetensors` or
-`pytorch_model*.bin` exists anywhere in the image. The rule "weights live on the
-network volume, never in the image" (locked decision 4) was previously enforced
-by convention and by the Dockerfile simply not copying them. Convention was not
-enough: an unrelated refactor moved the boot into module scope, which turned the
-import smoke test into a weight download. The guard makes the rule a build-time
-assertion, so the next such refactor fails loudly and cheaply instead of
-producing a fat image that deploys fine and costs storage forever.
+All four defects fixed after adversarial review are confirmed against real traffic,
+not a test double — most notably `truncated: false`, where the old `bool()` of the
+pipeline's truncation dict would have reported every successful song as truncated.
 
-## Production verification
-
-The image built on RunPod's platform and the endpoint is live. Three jobs were
-submitted and all three failed by design, in 235–300 ms each — which is the
-evidence that matters: the fail-fast ordering holds in production, so a
-misconfigured worker costs milliseconds rather than 70 seconds of GPU time.
-
-Full evidence, including what each failure establishes:
-**`review-findings.md`**.
-
-**Still unverified: no song has been generated.** Every job failed before
-generation, which the missing B2 configuration guarantees. The remaining gap is
-one endpoint setting, not a code change.
+Detail, including the error-path runs that preceded this: **`review-findings.md`**.
 
 ## What this stage does *not* prove
 
