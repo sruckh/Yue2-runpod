@@ -275,6 +275,19 @@ def test_the_compiler_env_vars_are_set(dockerfile: str) -> None:
     assert "CXX=g++" in dockerfile
 
 
+def test_the_env_assertion_runs_after_the_env_it_checks(dockerfile: str) -> None:
+    """The assertion must follow the `ENV` instruction, not precede it.
+
+    This was a real build failure: the check was placed before the `ENV`, so it
+    compared against variables that had not been set yet and the image failed to
+    build. The check was right about the question and wrong about its position —
+    and nothing but the build would have said so.
+    """
+    env_at = dockerfile.index("ENV PYTHONUNBUFFERED")
+    check_at = dockerfile.index('test "$PYTHONUNBUFFERED"')
+    assert env_at < check_at, "the ENV assertion appears before the ENV instruction it verifies, so it can only fail"
+
+
 def test_env_variables_are_asserted_not_assumed(dockerfile: str) -> None:
     """The ENV block must be proven to have parsed as written.
 

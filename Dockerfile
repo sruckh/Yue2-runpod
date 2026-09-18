@@ -69,7 +69,20 @@ RUN gcc --version > /dev/null && g++ --version > /dev/null \
     && echo "compiler present: $(gcc -dumpversion)" \
     && python -c "import shutil,sys; sys.exit(0 if shutil.which('gcc') else 'gcc not on PATH')"
 
-# Every variable the ENV block above claims to set must actually be set.
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    CC=gcc \
+    CXX=g++ \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    HF_HUB_DISABLE_TELEMETRY=1 \
+    HF_HOME=/runpod-volume/huggingface-cache
+
+# Every variable the ENV block just above claims to set must actually be set —
+# which is why this RUN sits *after* the ENV and not before it. The first
+# version of this check was placed before the ENV instruction, so it failed on
+# variables that had not been set yet: a check that was right about the question
+# and wrong about its own position in the file.
 #
 # `HF_HOME` is the discriminator for the comment question: if Docker had joined
 # the comment lines into the instruction rather than stripping them, the `#` would
@@ -82,14 +95,6 @@ RUN test "$PYTHONUNBUFFERED" = "1" \
     && test "$HF_HUB_DISABLE_TELEMETRY" = "1" \
     && test "$HF_HOME" = "/runpod-volume/huggingface-cache" \
     && echo "env verified: CC=$CC CXX=$CXX HF_HOME=$HF_HOME"
-
-ENV PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1 \
-    CC=gcc \
-    CXX=g++ \
-    PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    HF_HUB_DISABLE_TELEMETRY=1 \
-    HF_HOME=/runpod-volume/huggingface-cache
 
 WORKDIR /app
 
