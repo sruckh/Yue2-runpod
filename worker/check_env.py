@@ -237,20 +237,70 @@ def check_import(import_name: str) -> str:
         return f"{type(exc).__name__}: {exc}"
 
 
-def verify_cuda_build(package: str) -> str:
-    """Check that a torch has a CUDA build, not the CPU wheel from PyPI.
+def torch_cuda_version() -> str | None:
+    """The CUDA version torch was compiled against, or None if it is CPU-only.
 
-    `torch==2.10.0` is satisfied by both. Only one of them can use the GPU, and
-    the failure mode is a worker that boots, accepts jobs, and then fails at
-    `device="cuda"`.
+    `torch.version.cuda` is a compile-time constant, so this is answerable on a
+    machine with no GPU — which the build is.
+
+    Returns `""` when torch is absent or unimportable, so a caller can tell
+    "cannot determine" from "determined, and there is no CUDA".
+    """
+    try:
+        # Deliberately late: this *is* the check, and importing torch at module
+        # scope would make every invocation pay for it.
+        import torch
+    except BaseException:
+        return ""
+    cuda = getattr(getattr(torch, "version", None), "cuda", None)
+    return str(cuda) if cuda else None
+
+
+def verify_cuda_build(package: str) -> str:
+    """Check that a torch can use the GPU, not that it is spelt a certain way.
+
+    The question is whether this torch has CUDA, and there are two ways a build
+    can have it:
+
+    - **A local version identifier** — `2.10.0+cu128` from PyTorch's own index.
+      A plain `torch==2.10.0` from PyPI is the CPU wheel, so for that version the
+      identifier is the discriminator and its absence means CPU-only.
+    - **Bundled `nvidia-*` dependencies** — the newer arrangement, where a plain
+      `2.14.0` from PyPI pulls `nvidia-cudnn-cu13`, `nvidia-cublas` and
+      `cuda-toolkit` as ordinary dependencies. Such a wheel has **no** local
+      version identifier and is a perfectly good CUDA build.
+
+    Checking only for the identifier therefore reports a false failure on the
+    second arrangement, which is what happened: this function failed a build over
+    `torch 2.14.0` in the ASR environment — the very environment that had already
+    transcribed lyrics on a GPU in a completed cover job.
+
+    So the check reads `torch.version.cuda`, which is authoritative for both
+    arrangements, and falls back to the version string only when torch cannot be
+    imported (a build step that has not installed it yet).
     """
     if package != "torch":
         return ""
+
+    cuda = torch_cuda_version()
+    if cuda is None:
+        return (
+            "torch reports no CUDA build (`torch.version.cuda` is None); this looks "
+            'like the CPU-only wheel, and the worker would fail at device="cuda"'
+        )
+    if cuda:
+        return ""  # a CUDA build, by whichever arrangement
+
+    # torch is absent or unimportable here. Fall back to the string, which is
+    # weaker evidence but better than silence.
     version = installed_version("torch") or ""
     if not version:
         return ""
     if "+" not in version:
-        return "no local version identifier — this looks like the CPU-only wheel from PyPI"
+        return (
+            "cannot confirm a CUDA build: torch is not importable in this step and "
+            "the version carries no local identifier"
+        )
     if "cu" not in version:
         return f"local version {version.split('+', 1)[1]!r} does not name a CUDA build"
     return ""

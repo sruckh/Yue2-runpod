@@ -123,14 +123,52 @@ def test_cpu_only_torch_is_flagged(monkeypatch: pytest.MonkeyPatch) -> None:
     apart. The failure mode is a worker that boots, accepts jobs, and then fails
     at `device="cuda"` — so it is checked explicitly.
     """
-    monkeypatch.setattr(check_env, "installed_version", lambda p: "2.10.0")
+    monkeypatch.setattr(check_env, "torch_cuda_version", lambda: None)
     problem = check_env.verify_cuda_build("torch")
-    assert problem and "CPU-only" in problem
+    assert problem and "CUDA" in problem
 
 
-def test_cuda_torch_passes(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_cuda_torch_with_a_local_version_passes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The PyTorch-index arrangement: `2.10.0+cu128`."""
+    monkeypatch.setattr(check_env, "torch_cuda_version", lambda: "12.8")
+    assert check_env.verify_cuda_build("torch") == ""
+
+
+def test_cuda_torch_without_a_local_version_passes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The PyPI arrangement: a plain `2.14.0` that bundles `nvidia-*` packages.
+
+    This is the case the check used to fail. `torch==2.14.0` from PyPI carries no
+    local version identifier and is nonetheless a CUDA build — its 554 MB wheel
+    pulls `nvidia-cudnn-cu13`, `nvidia-cublas` and `cuda-toolkit` as ordinary
+    dependencies.
+
+    The false failure was not hypothetical: it stopped a build over the ASR
+    environment, which had already transcribed lyrics on a GPU in a completed
+    cover job. A check that rejects a working environment is worse than no check,
+    because it sends you to fix something that is not broken.
+    """
+    monkeypatch.setattr(check_env, "torch_cuda_version", lambda: "13.0")
+    # `installed_version` is pinned too, and that is not decoration. Without it
+    # this test passes against the *old* identifier-only logic, because torch is
+    # not installed on a dev box and that logic returns early on an empty version.
+    # Pinning it means the old logic reaches its own `"+" not in version` branch
+    # and fails here — which is the whole point of the test.
+    monkeypatch.setattr(check_env, "installed_version", lambda p: "2.14.0")
+    assert check_env.verify_cuda_build("torch") == ""
+
+
+def test_an_unimportable_torch_falls_back_to_the_version_string(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`""` means "cannot tell", which must not be read as "no CUDA".
+
+    A build step that has not installed torch yet gets the weaker string check
+    rather than a false failure.
+    """
+    monkeypatch.setattr(check_env, "torch_cuda_version", lambda: "")
     monkeypatch.setattr(check_env, "installed_version", lambda p: "2.10.0+cu128")
     assert check_env.verify_cuda_build("torch") == ""
+
+    monkeypatch.setattr(check_env, "installed_version", lambda p: "2.10.0")
+    assert "cannot confirm" in check_env.verify_cuda_build("torch")
 
 
 def test_non_torch_packages_are_not_cuda_checked(monkeypatch: pytest.MonkeyPatch) -> None:
