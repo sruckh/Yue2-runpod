@@ -204,6 +204,39 @@ can fail.
 
 **The unification question is therefore still open.** It has not been tested yet.
 
+### Second run: the probe worked, and found an absent package, not a conflict
+
+With both bugs fixed the probe ran properly — `BartDecoder` now resolves, and the
+SheetSage2 fetch completed (25 files). It then reported:
+
+```
+FAIL  ModuleNotFoundError: No module named 'torchaudio'
+VERDICT: it does not. The pinned split stack is required; do not unify.
+```
+
+**That verdict again overstated its evidence.** `torchaudio` was not
+*incompatible* — it was **absent**, because nothing in the main environment had
+ever needed it (SheetSage2 always lived in its own venv). Checked: torchaudio
+2.10.0 ships for cu128/cp311, and SheetSage2 uses only `torchaudio.info`,
+`.load` and `.functional.resample` — stable APIs. So the answer was to install
+the package, not to abandon the question.
+
+Fixed twice over:
+
+1. **`torchaudio==2.10.0` added to `worker/requirements.txt`**, version-matched
+   to torch. The probe can now complete instead of stopping at the first absent
+   import.
+2. **The probe distinguishes `missing` from `structural`.** A
+   `ModuleNotFoundError` means "the test could not complete", and the verdict now
+   reads `INCONCLUSIVE` rather than "do not unify". A missing package and a
+   version incompatibility both print as failure, but only the second answers the
+   question asked.
+
+The pattern is worth naming, because it is now the third instance this stage: the
+probe's *logic* was fixed and its *conclusion* was still wrong. Correct execution
+of a check is not the same as a correct claim drawn from it — and the gap is
+invisible from the check's own output, which looks equally confident either way.
+
 ## What this stage does **not** prove
 
 - **Neither venv has ever been built.** They are created in the RunPod image

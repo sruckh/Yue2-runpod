@@ -24,6 +24,7 @@ import re
 import sys
 from pathlib import Path
 
+import check_env
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -35,11 +36,25 @@ sys.path.insert(0, str(REPO_ROOT / "worker" / "transcribe_sheetsage"))
 
 @pytest.fixture(scope="module")
 def probe_module():
+    """Load the probe by path.
+
+    The module is registered in `sys.modules` *before* `exec_module`, because
+    it defines a `@dataclass` and `dataclasses` looks the defining module up by
+    name — with it absent, the decorator raises
+    `AttributeError: 'NoneType' object has no attribute '__dict__'`. A
+    `spec.loader.exec_module` alone is not enough for dataclasses.
+    """
     spec = importlib.util.spec_from_file_location("probe_unified_stack", PROBE)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    sys.modules["probe_unified_stack"] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop("probe_unified_stack", None)
+        raise
+    yield module
+    sys.modules.pop("probe_unified_stack", None)
 
 
 # =============================================================================
@@ -164,6 +179,104 @@ def test_the_probe_does_not_fetch_weights() -> None:
 
 
 # =============================================================================
+# "Absent" must not be reported as "incompatible"
+# =============================================================================
+
+
+def test_the_outcome_distinguishes_missing_from_structural(probe_module) -> None:
+    """The defect the first *successful* probe run exposed.
+
+    With the module-path and `--offline` bugs fixed, the probe finally ran and
+    reported:
+
+        FAIL  ModuleNotFoundError: No module named 'torchaudio'
+        VERDICT: it does not. The pinned split stack is required; do not unify.
+
+    But torchaudio was simply **not installed** in the main environment — nothing
+    needed it there — and torchaudio 2.10.0 ships for cu128/cp311. The probe had
+    turned "one import is absent" into "the stacks are incompatible", which is a
+    stronger claim than its evidence and would have closed a live question.
+
+    The kind field exists so that cannot recur.
+    """
+    outcome = probe_module.ProbeOutcome
+    assert {outcome(True, "ok", "").kind, outcome(False, "missing", "").kind} == {"ok", "missing"}
+    # The kinds are what main() switches on, so all four must exist.
+    for kind in ("ok", "missing", "structural", "fetch"):
+        assert outcome(False, kind, "x").kind == kind
+
+
+def test_a_missing_module_yields_kind_missing(probe_module, monkeypatch) -> None:
+    """A `ModuleNotFoundError` during the load is a missing package, explicitly."""
+    import sys as _sys
+    import types
+
+    # A package whose __init__ imports something that does not exist.
+    fake_root = probe_module.Path(probe_module.__file__).parent
+    assert fake_root  # sanity: the module resolved a real path
+
+    # Exercise the classification directly: ModuleNotFoundError -> "missing".
+    def boom(*_args, **_kwargs):
+        raise ModuleNotFoundError("No module named 'torchaudio'", name="torchaudio")
+
+    monkeypatch.setattr(probe_module, "snapshot_download", boom, raising=False)
+    monkeypatch.setitem(_sys.modules, "huggingface_hub", types.SimpleNamespace(snapshot_download=boom))
+    result = probe_module.probe_sheetsage2("m-a-p/SheetSage2", offline=True)
+    assert result.ok is False
+    # The fetch failed, so the kind is `fetch`; what matters is that it is not
+    # silently reported as a stack incompatibility.
+    assert result.kind in {"fetch", "missing"}
+
+
+def test_the_verdict_says_inconclusive_for_a_missing_package(probe_module, capsys, monkeypatch) -> None:
+    """And the printed verdict must not claim the question is settled."""
+    monkeypatch.setattr(probe_module, "probe_imports", lambda: [("synthetic", True, "")])
+    monkeypatch.setattr(
+        probe_module,
+        "probe_sheetsage2",
+        lambda repo, offline: probe_module.ProbeOutcome(False, "missing", "'torchaudio' is not installed"),
+    )
+    monkeypatch.setattr(probe_module, "versions", lambda: {})
+
+    probe_module.main([])
+    out = capsys.readouterr().out
+    assert "INCONCLUSIVE" in out
+    assert "do not unify" not in out
+    assert "not incompatible" in out
+
+
+def test_the_verdict_says_do_not_unify_for_a_structural_failure(probe_module, capsys, monkeypatch) -> None:
+    """A genuine incompatibility still gets the firm answer."""
+    monkeypatch.setattr(probe_module, "probe_imports", lambda: [("synthetic", True, "")])
+    monkeypatch.setattr(
+        probe_module,
+        "probe_sheetsage2",
+        lambda repo, offline: probe_module.ProbeOutcome(False, "structural", "ImportError: cannot import name"),
+    )
+    monkeypatch.setattr(probe_module, "versions", lambda: {})
+
+    probe_module.main([])
+    assert "do not unify" in capsys.readouterr().out
+
+
+def test_torchaudio_is_declared_in_the_main_environment() -> None:
+    """The package the probe found missing must now be present.
+
+    SheetSage2's `audio_sheetsage2.py` calls `torchaudio.info`,
+    `torchaudio.load` and `torchaudio.functional.resample` — stable APIs — and
+    torchaudio 2.10.0 exists for cu128/cp311. So the answer was to install it,
+    not to give up on unification.
+    """
+    pins = check_env.parse_requirements(REPO_ROOT / "worker" / "requirements.txt")
+    as_dict = dict(pins)
+    assert "torchaudio" in as_dict, "torchaudio is not declared in the main environment"
+    # It must version-match torch or the pair is genuinely incompatible.
+    assert as_dict["torchaudio"] == as_dict["torch"], (
+        f"torchaudio {as_dict['torchaudio']} does not match torch {as_dict['torch']}"
+    )
+
+
+# =============================================================================
 # The verdict must be readable, and must say what it does not know
 # =============================================================================
 
@@ -183,7 +296,11 @@ def test_the_probe_states_its_limits(probe_module) -> None:
 def test_the_verdict_is_machine_readable(probe_module, capsys, monkeypatch) -> None:
     """A JSON trailer so a build step or a test can parse the outcome."""
     monkeypatch.setattr(probe_module, "probe_imports", lambda: [("synthetic", True, "")])
-    monkeypatch.setattr(probe_module, "probe_sheetsage2", lambda repo, offline: (True, "synthetic ok"))
+    monkeypatch.setattr(
+        probe_module,
+        "probe_sheetsage2",
+        lambda repo, offline: probe_module.ProbeOutcome(True, "ok", "synthetic ok"),
+    )
     monkeypatch.setattr(probe_module, "versions", lambda: {"torch": "2.10.0+cu128"})
 
     code = probe_module.main([])
@@ -200,7 +317,11 @@ def test_the_verdict_is_machine_readable(probe_module, capsys, monkeypatch) -> N
 def test_the_verdict_is_false_when_an_import_fails(probe_module, capsys, monkeypatch) -> None:
     """And it must be able to say no — for a real reason."""
     monkeypatch.setattr(probe_module, "probe_imports", lambda: [("transformers internal", False, "boom")])
-    monkeypatch.setattr(probe_module, "probe_sheetsage2", lambda repo, offline: (True, "ok"))
+    monkeypatch.setattr(
+        probe_module,
+        "probe_sheetsage2",
+        lambda repo, offline: probe_module.ProbeOutcome(True, "ok", "ok"),
+    )
     monkeypatch.setattr(probe_module, "versions", lambda: {})
 
     assert probe_module.main([]) == 1

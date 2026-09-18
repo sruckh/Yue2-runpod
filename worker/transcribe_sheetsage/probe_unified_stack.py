@@ -46,6 +46,7 @@ import argparse
 import json
 import sys
 import traceback
+from dataclasses import dataclass
 from importlib import metadata
 from pathlib import Path
 
@@ -103,7 +104,23 @@ def probe_imports() -> list[tuple[str, bool, str]]:
     return results
 
 
-def probe_sheetsage2(repo_id: str, offline: bool) -> tuple[bool, str]:
+@dataclass
+class ProbeOutcome:
+    """Whether SheetSage2's code loaded, and — when it did not — *why not*.
+
+    The distinction is the point. A missing package and a version
+    incompatibility both print as failure, but only the second one answers the
+    question this probe asks. Reporting "cannot unify" for an absent import
+    overstates the evidence, which is what the first real run did.
+    """
+
+    ok: bool
+    #: `ok` | `missing` | `structural` | `fetch`
+    kind: str
+    detail: str
+
+
+def probe_sheetsage2(repo_id: str, offline: bool) -> ProbeOutcome:
     """Download SheetSage2's *code* and import it, without loading weights.
 
     `AutoConfig` pulls `configuration_sheetsage2.py` and its imports; the model
@@ -114,7 +131,7 @@ def probe_sheetsage2(repo_id: str, offline: bool) -> tuple[bool, str]:
     try:
         from huggingface_hub import snapshot_download
     except ImportError as exc:
-        return False, f"huggingface_hub unavailable: {exc}"
+        return ProbeOutcome(False, "missing", f"huggingface_hub unavailable: {exc}")
 
     try:
         # Only the Python source and the config — no weights, no assets.
@@ -124,7 +141,7 @@ def probe_sheetsage2(repo_id: str, offline: bool) -> tuple[bool, str]:
             local_files_only=offline,
         )
     except Exception as exc:
-        return False, f"could not fetch SheetSage2 code: {type(exc).__name__}: {exc}"
+        return ProbeOutcome(False, "fetch", f"could not fetch SheetSage2 code: {type(exc).__name__}: {exc}")
 
     # The repo is a **package**, not a set of loose modules: its files use
     # relative imports (`from .modeling_mert2 import MERT2Model`). A bare
@@ -154,7 +171,7 @@ def probe_sheetsage2(repo_id: str, offline: bool) -> tuple[bool, str]:
             submodule_search_locations=[str(path)],
         )
         if spec is None or spec.loader is None:
-            return False, f"could not build a package spec from {path}"
+            return ProbeOutcome(False, "structural", f"could not build a package spec from {path}")
         package = importlib.util.module_from_spec(spec)
         sys.modules[package_name] = package
         spec.loader.exec_module(package)
@@ -162,7 +179,7 @@ def probe_sheetsage2(repo_id: str, offline: bool) -> tuple[bool, str]:
         model_module = importlib.import_module(f"{package_name}.modeling_sheetsage2")
         model_class = getattr(model_module, "SheetSage2Model", None)
         if model_class is None:
-            return False, "modeling_sheetsage2 imported but exposes no SheetSage2Model"
+            return ProbeOutcome(False, "structural", "modeling_sheetsage2 imported but exposes no SheetSage2Model")
 
         # The tokenizer is a second code path with its own imports.
         tokenizer_module = importlib.import_module(f"{package_name}.tokenization_sheetsage2")
@@ -192,16 +209,22 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  {'ok  ' if ok else 'FAIL'}  {label}" + (f"  — {error}" if error else ""))
 
     print(f"\n=== {args.repo} code under this stack ===")
-    ok, detail = probe_sheetsage2(args.repo, args.offline)
-    print(f"  {'ok  ' if ok else 'FAIL'}  {detail}")
+    outcome = probe_sheetsage2(args.repo, args.offline)
+    print(f"  {'ok  ' if outcome.ok else 'FAIL'}  [{outcome.kind}] {outcome.detail}")
 
-    verdict = ok and all(o for _, o, _ in imports)
+    imports_ok = all(o for _, o, _ in imports)
+    verdict = outcome.ok and imports_ok
     print()
     if verdict:
         print("VERDICT: SheetSage2's code loads under the unified stack.")
         print("         Numerical correctness is still unverified — that needs weights and a GPU.")
+    elif outcome.kind == "missing":
+        # The honest answer is "the test did not complete", not "no".
+        print("VERDICT: INCONCLUSIVE — the test could not complete.")
+        print(f"         A package is absent, not incompatible: {outcome.detail}")
+        print("         Add it and re-run; this says nothing yet about whether the stacks unify.")
     else:
-        print("VERDICT: it does not. The pinned split stack is required; do not unify.")
+        print(f"VERDICT: it does not ({outcome.kind}). The pinned split stack is required; do not unify.")
 
     # Machine-readable trailer so a build step or a test can parse the outcome.
     print(
@@ -210,7 +233,11 @@ def main(argv: list[str] | None = None) -> int:
             {
                 "unified_stack_ok": verdict,
                 "imports": {label: ok_ for label, ok_, _ in imports},
-                "sheetsage2": {"ok": ok, "detail": detail.splitlines()[0] if detail else ""},
+                "sheetsage2": {
+                    "ok": outcome.ok,
+                    "kind": outcome.kind,
+                    "detail": outcome.detail.splitlines()[0] if outcome.detail else "",
+                },
                 "versions": versions(),
             }
         )

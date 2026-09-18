@@ -15,6 +15,13 @@
 --extra-index-url https://download.pytorch.org/whl/cu128
 
 torch==2.10.0
+# torchaudio must version-match torch. It is here because SheetSage2's code —
+# which the unification probe imports into this environment — uses
+# `torchaudio.load`, `.info` and `.functional.resample`. Those are stable APIs
+# and torchaudio 2.10.0 ships for cu128/cp311, so this is a missing package
+# rather than a version conflict. It is also what a unified environment would
+# need regardless.
+torchaudio==2.10.0
 transformers==4.57.6
 huggingface-hub==0.36.2
 safetensors==0.7.0
