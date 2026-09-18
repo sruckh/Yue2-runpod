@@ -33,7 +33,7 @@ from boot import (
     install_model_wheel,
     resolve_cached_snapshot,
 )
-from config import MODEL_REPO, MODEL_WHEEL, VAE_REPO, CacheConfig
+from config import ASR_REPO, MODEL_REPO, MODEL_WHEEL, VAE_REPO, CacheConfig
 
 
 class SnapshotRecorder:
@@ -78,9 +78,15 @@ def cached_all(volume: Path) -> None:
     worker no longer considers complete. Deriving it means a repo added to the
     worker is populated here automatically.
     """
-    for repo_id, required, _patterns in CACHED_REPOS:
-        files = (*required, MODEL_WHEEL) if repo_id == MODEL_REPO else required
-        populate_runpod_cache(volume, repo_id, files)
+    for repo_id, required, _patterns, weights_any in CACHED_REPOS:
+        files = list(required)
+        if weights_any:
+            # One spelling is enough: a repo ships either a single file or
+            # shards plus an index, and the check accepts either.
+            files.append(weights_any[0])
+        if repo_id == MODEL_REPO:
+            files.append(MODEL_WHEEL)
+        populate_runpod_cache(volume, repo_id, tuple(files))
 
 
 # =============================================================================
@@ -134,7 +140,7 @@ def test_runpod_cache_hit_downloads_nothing(volume: Path, fake_hf: SnapshotRecor
     assert fake_hf.calls == [], "a populated RunPod cache must not trigger a download"
     # All four, not the two the create path uses: offline mode is global, so a
     # repo the cover path needs but this list omits is unreachable, not slow.
-    assert set(report.from_cache) == {repo for repo, _, _ in CACHED_REPOS}
+    assert set(report.from_cache) == {repo for repo, _, _, _ in CACHED_REPOS}
     assert report.downloaded == {}
 
 
@@ -165,7 +171,7 @@ def test_missing_model_falls_back_to_download(volume: Path, fake_hf: SnapshotRec
 
     assert [c["repo_id"] for c in fake_hf.calls] == [MODEL_REPO], "only the absent repo may be fetched"
     assert set(report.downloaded) == {MODEL_REPO}
-    assert set(report.from_cache) == {repo for repo, _, _ in CACHED_REPOS} - {MODEL_REPO}
+    assert set(report.from_cache) == {repo for repo, _, _, _ in CACHED_REPOS} - {MODEL_REPO}
 
 
 def test_fallback_uses_cache_dir_not_local_dir(volume: Path, fake_hf: SnapshotRecorder) -> None:
@@ -202,7 +208,7 @@ def test_second_call_after_fallback_needs_no_network(volume: Path, fake_hf: Snap
 
 def test_fallback_downloads_both_when_volume_is_cold(volume: Path, fake_hf: SnapshotRecorder) -> None:
     report = ensure_models(CacheConfig())
-    assert set(report.downloaded) == {repo for repo, _, _ in CACHED_REPOS}
+    assert set(report.downloaded) == {repo for repo, _, _, _ in CACHED_REPOS}
     assert report.from_cache == {}
 
 
@@ -300,7 +306,12 @@ def test_download_excludes_demo_assets(volume: Path, fake_hf: SnapshotRecorder) 
         patterns = call["allow_patterns"]
         assert patterns
         assert not any(p.startswith("assets/") for p in patterns)
-        assert "model.safetensors" in patterns
+        # Either spelling downloads the weights: `model.safetensors` for a
+        # single-file repo, `*.safetensors` to catch shards. Asserting one
+        # spelling is what let the ASR repo ship with its weights unreachable.
+        assert "model.safetensors" in patterns or "*.safetensors" in patterns, (
+            f"{call['repo_id']}: patterns cannot download the weights: {patterns}"
+        )
 
 
 def test_model_download_includes_the_wheel(volume: Path, fake_hf: SnapshotRecorder) -> None:
@@ -417,7 +428,7 @@ def test_every_repo_the_cover_children_default_to_is_cached() -> None:
     import ast
 
     worker = Path(__file__).resolve().parent.parent / "worker"
-    cached = {repo for repo, _, _ in CACHED_REPOS}
+    cached = {repo for repo, _, _, _ in CACHED_REPOS}
 
     child_defaults: dict[str, str] = {}
     for entrypoint in ("transcribe_sheetsage/run.py", "transcribe_asr/run.py"):
@@ -458,7 +469,7 @@ def test_offline_mode_is_enabled_only_after_every_repo_is_verified() -> None:
     import inspect
 
     source = inspect.getsource(ensure_models)
-    loop_at = source.index("for repo_id, required, patterns in CACHED_REPOS")
+    loop_at = source.index("for repo_id, required, patterns, weights_any in CACHED_REPOS")
     offline_at = source.index("cache.enable_offline_mode()")
     assert loop_at < offline_at, "offline mode is enabled before the cache is verified"
 
@@ -470,7 +481,7 @@ def test_the_cover_repos_are_required_not_merely_downloaded() -> None:
     required file. An empty tuple makes "present" mean "a directory exists",
     which is how a truncated download would slip through.
     """
-    for repo_id, required, patterns in CACHED_REPOS:
+    for repo_id, required, patterns, _weights in CACHED_REPOS:
         assert required, f"{repo_id} has no required files, so its presence is never verified"
         assert "config.json" in required, f"{repo_id} does not require config.json"
         for name in required:
@@ -500,7 +511,7 @@ def test_a_parent_model_loaded_transitively_is_cached() -> None:
     test needs no network. When upstream changes the chain this fails, and the
     fix is to re-read the configs and update both.
     """
-    cached = {repo for repo, _, _ in CACHED_REPOS}
+    cached = {repo for repo, _, _, _ in CACHED_REPOS}
     for child, parent in KNOWN_TRANSITIVE_LOADS.items():
         assert child in cached, f"{child} loads {parent} but is not itself cached"
         assert parent in cached, (
@@ -521,3 +532,114 @@ def test_the_transitive_chain_is_documented_where_a_reader_will_look() -> None:
     entrypoint = (worker / "transcribe_sheetsage" / "run.py").read_text(encoding="utf-8")
     assert "MERT-v2-FullSong" in entrypoint, "the transitive parent is not mentioned at the entrypoint"
     assert "MERT_REPO" in (worker / "config.py").read_text(encoding="utf-8")
+
+
+# =============================================================================
+# Weights may be single-file or sharded
+# =============================================================================
+#
+# The bug these exist for, from a production boot (2026-09-18):
+#
+#     Worker unavailable: Qwen/Qwen3-ASR-1.7B is still missing
+#     ['model.safetensors'] after download.
+#
+# Two faults in one list, both from writing ASR's entry by analogy with the
+# other four repos instead of reading ASR's own file listing:
+#
+#   1. `REQUIRED_ASR_FILES` demanded `model.safetensors`, which does not exist
+#      in that repo — it ships two shards plus an index.
+#   2. `ASR_FILE_PATTERNS` did not match `model-0000*-of-00002.safetensors`, so
+#      the weights had not been downloaded at all. The error named a file that
+#      had never existed upstream.
+#
+# The fix is to stop naming a spelling: `WEIGHTS_ANY` accepts either layout, and
+# the patterns use `*.safetensors`.
+
+
+def test_weights_check_accepts_a_single_file(tmp_path: Path) -> None:
+    (tmp_path / "config.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "model.safetensors").write_bytes(b"w")
+    assert boot._missing_files(tmp_path, ("config.json",), boot.WEIGHTS_ANY) == []
+
+
+def test_weights_check_accepts_shards_plus_an_index(tmp_path: Path) -> None:
+    """The ASR repo's actual layout, which the old check rejected."""
+    (tmp_path / "config.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "model-00001-of-00002.safetensors").write_bytes(b"w")
+    (tmp_path / "model-00002-of-00002.safetensors").write_bytes(b"w")
+    (tmp_path / "model.safetensors.index.json").write_text("{}", encoding="utf-8")
+    assert boot._missing_files(tmp_path, ("config.json",), boot.WEIGHTS_ANY) == []
+
+
+def test_weights_check_reports_a_repo_with_no_weights(tmp_path: Path) -> None:
+    """A config-only tree must fail, and say what was expected."""
+    (tmp_path / "config.json").write_text("{}", encoding="utf-8")
+    missing = boot._missing_files(tmp_path, ("config.json",), boot.WEIGHTS_ANY)
+    assert missing, "a repo with no weights must not pass the presence check"
+    assert "model.safetensors" in missing[0], "the error must name what was expected"
+
+
+#: Repos whose weights ship as multiple shards, verified against the Hub on
+#: 2026-09-18 by reading each listing. The other four each ship exactly
+#: `model.safetensors` and are single-file.
+KNOWN_SHARDED_REPOS = frozenset({ASR_REPO})
+
+
+def test_a_sharded_repo_can_actually_download_its_shards() -> None:
+    """A glob, not a spelled-out filename — the assertion that was missing.
+
+    Accepting `model.safetensors` as "can download weights" is not enough: for a
+    sharded repo that name matches nothing, and the list looks fine while the
+    weights are unreachable. The check therefore keys on the *known layout*
+    rather than on either spelling being present.
+    """
+    for repo_id, _required, patterns, _weights in CACHED_REPOS:
+        if repo_id in KNOWN_SHARDED_REPOS:
+            assert "*.safetensors" in patterns, (
+                f"{repo_id} ships shards; without a glob its weights cannot be downloaded at all. patterns={patterns}"
+            )
+        else:
+            assert "model.safetensors" in patterns, f"{repo_id}: single-file weights not downloaded"
+
+
+def test_the_sharded_layout_fact_is_what_the_asr_entry_relies_on() -> None:
+    """Ties the verified layout to the entry, so a change to either is caught.
+
+    If ASR ever ships single-file, this fails and both `KNOWN_SHARDED_REPOS` and
+    the patterns can be updated together — rather than one drifting.
+    """
+    assert ASR_REPO in KNOWN_SHARDED_REPOS
+    patterns = next(spec for spec in CACHED_REPOS if spec[0] == ASR_REPO)[2]
+    assert "*.safetensors" in patterns
+    # The four single-file repos must NOT be in the sharded set.
+    for repo_id, _r, _p, _w in CACHED_REPOS:
+        if repo_id != ASR_REPO:
+            assert repo_id not in KNOWN_SHARDED_REPOS
+
+
+def test_required_files_are_downloadable_and_weights_are_checked_by_layout() -> None:
+    """Two rules, both checkable without the network.
+
+    1. Every `required` name must appear in `patterns`, or the check demands a
+       file the download never fetches — a guaranteed boot failure.
+    2. `WEIGHTS_ANY` must be set for every repo, so presence is satisfied by
+       either layout.
+
+    Note what this does *not* assert: that `required` avoids naming
+    `model.safetensors`. The four single-file repos legitimately name it, and
+    their listings were verified against the Hub — YuE2-3B, YuE2-Vae, SheetSage2
+    and MERT-v2-FullSong all ship exactly `model.safetensors`. Only ASR is
+    sharded, and only ASR must therefore avoid the literal. The rule is "required
+    names files the repo actually has", not "required avoids weights".
+    """
+    for repo_id, required, patterns, weights_any in CACHED_REPOS:
+        assert weights_any, f"{repo_id} has no weights check"
+        for name in required:
+            assert name in patterns, f"{repo_id}: {name!r} is required but never downloaded"
+
+    # The sharded repo must not name a single-file spelling.
+    asr = next(spec for spec in CACHED_REPOS if spec[0] == ASR_REPO)
+    assert not any(name.endswith(".safetensors") for name in asr[1]), (
+        f"{ASR_REPO} is sharded; requiring a single-file spelling is what failed a "
+        f"production boot. Its required list is {asr[1]}."
+    )
