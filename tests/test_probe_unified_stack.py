@@ -1,7 +1,7 @@
 """Tests for the unification probe's own correctness.
 
 The probe exists to answer one question empirically, and it has now failed to
-answer it in four different ways — every one of them a bug in the probe:
+answer it in five different ways — every one of them a bug in the probe:
 
 1. It listed `transformers.models.bart.modeling_bart.BartDecoder` as a module and
    handed it to `importlib.import_module`, which takes a *module*. `BartDecoder`
@@ -14,12 +14,15 @@ answer it in four different ways — every one of them a bug in the probe:
    simply not installed and 2.10.0 ships for cu128/cp311.
 4. With torchaudio installed it finally fetched the code and crashed on its own
    success path: `AttributeError: 'tuple' object has no attribute 'ok'`.
+5. With the scan made static it reported `flash_attn, playwright` as blockers —
+   two function-scope imports, one behind an `attn_implementation` branch and one
+   in the render path. It ran perfectly and drew the wrong conclusion.
 
 Runs 1-3 all printed the same verdict, and none of them was evidence about
 anything. A probe that lies is worse than no probe: it converts "unknown" into
 "no", and the answer looks settled. These tests pin the properties that make the
-probe's answer meaningful, and — after run 4 — the property that makes it able to
-produce an answer at all.
+probe's answer meaningful, and the ones that make it able to produce an answer at
+all.
 """
 
 from __future__ import annotations
@@ -102,8 +105,9 @@ def test_every_return_in_probe_sheetsage2_is_a_probe_outcome() -> None:
 
     def annotated_outcome_helpers() -> set[str]:
         # Constructing the dataclass is directly fine; a helper is fine when it
-        # declares the same return type.
-        helpers = {"ProbeOutcome"}
+        # declares the same return type. `replace` is dataclasses.replace, which
+        # returns the same type it is given.
+        helpers = {"ProbeOutcome", "replace"}
         for node in ast.walk(tree):
             if (
                 isinstance(node, ast.FunctionDef)
@@ -254,8 +258,8 @@ def test_the_scan_treats_the_repos_own_files_as_local(probe_module, tmp_path: Pa
     local = probe_module.local_module_names(repo)
     assert {"modeling_sheetsage2", "infer"} <= local
     # numpy is real; the siblings must not appear.
-    assert "modeling_sheetsage2" not in probe_module.third_party_imports(repo)
-    assert "infer" not in probe_module.third_party_imports(repo)
+    assert "modeling_sheetsage2" not in probe_module.sheet_sage_imports(repo)[0]
+    assert "infer" not in probe_module.sheet_sage_imports(repo)[0]
 
 
 def test_relative_imports_are_not_mistaken_for_dependencies(probe_module, tmp_path: Path) -> None:
@@ -273,7 +277,7 @@ def test_relative_imports_are_not_mistaken_for_dependencies(probe_module, tmp_pa
     )
     (repo / "b.py").write_text("", encoding="utf-8")
 
-    found = probe_module.third_party_imports(repo)
+    found = probe_module.sheet_sage_imports(repo)[0]
     assert "numpy" in found
     assert "b" not in found, "a relative import was reported as a dependency"
     assert "os" not in found, "a stdlib import was reported as a dependency"
@@ -294,7 +298,7 @@ def test_the_scan_finds_a_module_scope_import_that_would_break_the_load(probe_mo
         "import mir_eval.chord\nimport numpy as np\nimport pretty_midi\n", encoding="utf-8"
     )
 
-    found = probe_module.third_party_imports(repo)
+    found = probe_module.sheet_sage_imports(repo)[0]
     # The submodule import is recorded by its top-level package.
     assert {"mir_eval", "pretty_midi"} <= found
     assert "numpy" in found
@@ -362,6 +366,127 @@ def test_the_sheetsage_dependencies_are_pinned_in_the_main_environment() -> None
     # resolver — pinning a scipy whose numpy ceiling is below our numpy would
     # create the very conflict this probe exists to rule out.
     assert "scipy" not in pins, "scipy is pinned, which risks a numpy ceiling conflict"
+
+
+# =============================================================================
+# Scope: a function-scope import is not a blocker
+# =============================================================================
+#
+# The fifth failure, and the first that was not a crash or a wrong verdict but a
+# misclassification. The static scan ran perfectly and reported:
+#
+#     2 of the 10 modules SheetSage2 imports are not installed: flash_attn, playwright
+#
+# Both are imported *inside functions* — `flash_attn` behind an
+# `attn_implementation` branch in `modeling_mert2.py:forward()`, `playwright`
+# inside `rendering_sheetsage2.py:_render()`. Neither is needed to import the
+# model, and neither is needed for inference. The scan counted them as blockers,
+# which would have added a browser runtime and a CUDA-compiled attention kernel
+# to the image to satisfy imports that never execute.
+#
+# The distinction is scope, and it is the whole correctness of the scan.
+
+
+def test_a_module_scope_import_is_required(probe_module) -> None:
+    tree = ast.parse("import numpy\nfrom scipy import stats\n")
+    required, deferred = probe_module._classify_imports(tree)
+    assert required == {"numpy", "scipy"}
+    assert deferred == set()
+
+
+def test_a_function_scope_import_is_deferred(probe_module) -> None:
+    """`flash_attn` lives here: inside `forward`, behind a branch."""
+    tree = ast.parse(
+        "def forward(self, x):\n"
+        "    if self.attn == 'flash':\n"
+        "        from flash_attn import flash_attn_func\n"
+        "        return flash_attn_func(x)\n"
+        "    return x\n"
+    )
+    required, deferred = probe_module._classify_imports(tree)
+    assert required == set()
+    assert deferred == {"flash_attn"}
+
+
+def test_a_guarded_import_is_deferred_even_at_module_scope(probe_module) -> None:
+    """`try: import x / except ImportError:` is a library testing presence.
+
+    The author has explicitly said the dependency is optional, so treating it as
+    required would fail on a package that is absent by design.
+    """
+    tree = ast.parse("try:\n    import flash_attn\nexcept ImportError:\n    flash_attn = None\n")
+    required, deferred = probe_module._classify_imports(tree)
+    assert required == set()
+    assert deferred == {"flash_attn"}
+
+
+def test_a_nested_function_import_is_deferred(probe_module) -> None:
+    """`playwright` sits inside `_render`, which is inside module scope."""
+    tree = ast.parse("def outer():\n    def inner():\n        import playwright\n    return inner\n")
+    required, deferred = probe_module._classify_imports(tree)
+    assert required == set()
+    assert deferred == {"playwright"}
+
+
+def test_the_sheetsage_scan_separates_the_two_scopes(probe_module, tmp_path: Path) -> None:
+    """The real shape: mir_eval required, flash_attn and playwright deferred.
+
+    Pinned as a whole so a regression that re-merges the two sets fails here with
+    the actual finding rather than only in a build.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "__init__.py").write_text("", encoding="utf-8")
+    (repo / "midi_sheetsage2.py").write_text("import mir_eval.chord\n", encoding="utf-8")
+    (repo / "modeling_mert2.py").write_text(
+        "def forward(self):\n    from flash_attn import flash_attn_func\n", encoding="utf-8"
+    )
+    (repo / "rendering_sheetsage2.py").write_text(
+        "def _render():\n    from playwright.sync_api import sync_playwright\n", encoding="utf-8"
+    )
+
+    required, deferred = probe_module.sheet_sage_imports(repo)
+    assert required == {"mir_eval"}
+    assert deferred == {"flash_attn", "playwright"}
+
+
+def test_an_absent_optional_import_does_not_block_the_load(probe_module, tmp_path: Path, monkeypatch) -> None:
+    """The behaviour that was wrong: the load still has to be attempted.
+
+    If a deferred import is genuinely needed, the load raises and `load_sheetsage2`
+    reports it — so relying on the load is not a weakening. Not attempting it is.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "__init__.py").write_text("", encoding="utf-8")
+    (repo / "a.py").write_text("def f():\n    import absolutely_not_installed_optional\n", encoding="utf-8")
+    monkeypatch.setitem(sys.modules, "huggingface_hub", types.SimpleNamespace(snapshot_download=lambda *a, **k: repo))
+
+    attempted = []
+
+    def fake_load(root):
+        attempted.append(root)
+        return probe_module.ProbeOutcome(True, "ok", "loaded")
+
+    monkeypatch.setattr(probe_module, "load_sheetsage2", fake_load)
+
+    outcome = probe_module.probe_sheetsage2("synthetic/repo", offline=False)
+    assert attempted, "the load was skipped because of an optional import"
+    assert outcome.ok is True
+    assert outcome.optional_absent == ("absolutely_not_installed_optional",)
+
+
+def test_the_optional_packages_are_not_pinned_in_the_image() -> None:
+    """Neither belongs in the image, and each for its own reason.
+
+    `playwright` needs a Chromium download; `flash_attn` needs a CUDA-compiled
+    kernel and is only reachable through an `attn_implementation` branch. Both
+    are function-scope imports, so both are optional by the authors' design.
+    """
+    pins = dict(check_env.parse_requirements(REPO_ROOT / "worker" / "requirements.txt"))
+    assert "playwright" not in pins
+    assert "flash-attn" not in pins
+    assert "flash_attn" not in pins
 
 
 # =============================================================================

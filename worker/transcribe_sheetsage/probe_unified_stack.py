@@ -28,13 +28,22 @@ move between transformers releases. Verified present in 4.57.6, but "the symbol
 exists" and "the model constructs" are different claims, and only the second one
 matters.
 
-Why the scan is static
-----------------------
+Why the scan is static, and scope-aware
+---------------------------------------
 The first four runs of this probe each discovered **one** absent package and
 stopped, so each answer cost a full image build: torchaudio, then mir_eval, and
 the queue behind them unknown. Importing to find out is what makes that
 one-at-a-time; `absent_modules` reads the downloaded source with `ast` and
 reports every absent dependency in a single pass instead.
+
+The first version of that scan then counted **every** import as a blocker and
+reported `flash_attn, playwright` — two packages imported *inside functions*,
+one behind an `attn_implementation` branch and one in the render path. Neither
+is needed to import the model. **Scope is the distinction that matters**: a
+module-scope import must resolve for the module to load at all, a function-scope
+one only if that path runs. `_classify_imports` separates them, and the load
+afterwards is the authority — a deferred import that is genuinely needed raises
+there.
 
 What this does and does not prove
 ---------------------------------
@@ -62,7 +71,7 @@ import json
 import sys
 import traceback
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from importlib import metadata
 from pathlib import Path
 
@@ -143,27 +152,83 @@ def local_module_names(root: Path) -> set[str]:
     return names
 
 
-def third_party_imports(root: Path) -> set[str]:
-    """Every top-level module the source imports, minus stdlib and its own files.
+def _classify_imports(tree: ast.Module) -> tuple[set[str], set[str]]:
+    """Split a module's imports into `(required, deferred)` top-level names.
 
-    Static by design. Importing to discover this stops at the first failure, so
-    the caller learns one absent package per attempt — and each attempt is a
-    build. Reading the source with `ast` answers it completely in one pass.
+    **Scope is the distinction that matters**, and getting it wrong is how this
+    scan first reported `flash_attn` and `playwright` as blockers:
+
+    - an import at module scope must resolve for the module to import at all
+    - an import inside a function resolves only if that code path runs, which
+      for `flash_attn` means an `attn_implementation` branch that is not taken
+      by default, and for `playwright` means rendering, which the worker never does
+
+    A `try: import x / except ImportError:` guard is also deferred — that is a
+    library checking whether an optional dependency is present, so treating it
+    as required would fail on a package the author explicitly made optional.
+    """
+    parents: dict[int, ast.AST] = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parents[id(child)] = node
+
+    def is_deferred(node: ast.AST) -> bool:
+        current = parents.get(id(node))
+        while current is not None:
+            if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                return True
+            if isinstance(current, ast.Try):
+                for handler in current.handlers:
+                    caught = handler.type
+                    names: list[str] = []
+                    if isinstance(caught, ast.Name):
+                        names = [caught.id]
+                    elif isinstance(caught, ast.Tuple):
+                        names = [element.id for element in caught.elts if isinstance(element, ast.Name)]
+                    if any(
+                        name in {"ImportError", "ModuleNotFoundError", "Exception", "BaseException"} for name in names
+                    ):
+                        return True
+            current = parents.get(id(current))
+        return False
+
+    required: set[str] = set()
+    deferred: set[str] = set()
+    for node in ast.walk(tree):
+        names: list[str] = []
+        if isinstance(node, ast.Import):
+            names = [alias.name.split(".")[0] for alias in node.names]
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            # level > 0 is relative: part of this repo, not a dependency.
+            names = [node.module.split(".")[0]]
+        if names:
+            (deferred if is_deferred(node) else required).update(names)
+    return required, deferred
+
+
+def sheet_sage_imports(root: Path) -> tuple[set[str], set[str]]:
+    """Every third-party module the source imports, split by scope.
+
+    `required` must be installed for the model to import; `deferred` is needed
+    only if the relevant code path runs. Both exclude stdlib and the repo's own
+    files.
     """
     local = local_module_names(root)
-    found: set[str] = set()
+    required: set[str] = set()
+    deferred: set[str] = set()
     for path in sorted(root.rglob("*.py")):
         try:
             tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
         except SyntaxError:
             continue
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                found.update(alias.name.split(".")[0] for alias in node.names)
-            # level > 0 is relative: part of this repo, not a dependency.
-            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
-                found.add(node.module.split(".")[0])
-    return {name for name in found if name not in sys.stdlib_module_names and name not in local}
+        module_required, module_deferred = _classify_imports(tree)
+        required |= module_required
+        deferred |= module_deferred
+
+    def keep(names: set[str]) -> set[str]:
+        return {name for name in names if name not in sys.stdlib_module_names and name not in local}
+
+    return keep(required), keep(deferred - required)
 
 
 def absent_modules(modules: Iterable[str]) -> list[str]:
@@ -204,6 +269,9 @@ class ProbeOutcome:
     #: Every absent dependency, when `kind` is `missing`. All of them, not the
     #: first — that list is the whole reason the scan is static.
     missing: tuple[str, ...] = ()
+    #: Absent packages that are imported *inside a function* and so are only
+    #: needed on a code path the worker does not take. Reported, never blocking.
+    optional_absent: tuple[str, ...] = ()
 
 
 def load_sheetsage2(root: Path) -> ProbeOutcome:
@@ -284,7 +352,7 @@ def probe_sheetsage2(repo_id: str, offline: bool) -> ProbeOutcome:
 
     root = Path(path)
     try:
-        required = third_party_imports(root)
+        required, deferred = sheet_sage_imports(root)
     except OSError as exc:
         return ProbeOutcome(False, "structural", f"could not scan {root}: {type(exc).__name__}: {exc}")
 
@@ -293,11 +361,18 @@ def probe_sheetsage2(repo_id: str, offline: bool) -> ProbeOutcome:
         return ProbeOutcome(
             False,
             "missing",
-            f"{len(absent)} of the {len(required)} modules SheetSage2 imports are not installed: {', '.join(absent)}",
+            f"{len(absent)} of the {len(required)} modules SheetSage2 imports at module scope "
+            f"are not installed: {', '.join(absent)}",
             tuple(absent),
         )
 
-    return load_sheetsage2(root)
+    # Optional imports are reported, never blocking. `flash_attn` is imported
+    # inside an `attn_implementation` branch and `playwright` inside the render
+    # function; both are absent by design and the load below will confirm it.
+    optional_absent = tuple(absent_modules(deferred))
+
+    outcome = load_sheetsage2(root)
+    return replace(outcome, optional_absent=optional_absent)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -319,8 +394,16 @@ def main(argv: list[str] | None = None) -> int:
     outcome = probe_sheetsage2(args.repo, args.offline)
     print(f"  {'ok  ' if outcome.ok else 'FAIL'}  [{outcome.kind}] {outcome.detail}")
     if outcome.missing:
-        print("\n  SheetSage2's code imports these and they are not installed here:")
+        print("\n  SheetSage2 imports these at module scope and they are not installed here:")
         for name in outcome.missing:
+            print(f"    - {name}")
+    if outcome.optional_absent:
+        # Named, not hidden. These are imported inside functions — flash_attn
+        # behind an attn_implementation branch, playwright in the render path —
+        # so they are absent on purpose. If the load had actually needed one it
+        # would have raised on the line above instead of passing.
+        print("\n  Optional; imported inside a function, not needed for inference:")
+        for name in outcome.optional_absent:
             print(f"    - {name}")
 
     imports_ok = all(o for _, o, _ in imports)
@@ -349,6 +432,7 @@ def main(argv: list[str] | None = None) -> int:
                     "kind": outcome.kind,
                     "detail": outcome.detail.splitlines()[0] if outcome.detail else "",
                     "missing": list(outcome.missing),
+                    "optional_absent": list(outcome.optional_absent),
                 },
                 "versions": versions(),
             }
