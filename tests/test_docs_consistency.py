@@ -309,3 +309,62 @@ def test_the_readme_does_not_promise_more_than_one_cached_model() -> None:
     )
     # And the transitive parent has to be named, or `cover` boots and then fails.
     assert "MERT-v2-FullSong" in text, "the README omits SheetSage2's encoder parent"
+
+
+# =============================================================================
+# Which modes need which model repos
+# =============================================================================
+#
+# The README told deployers that `edit` needs SheetSage2. It does not: both
+# `run_stage` calls live in `prepare_cover`, and `prepare_edit` makes none — it
+# re-renders a score it is given and never transcribes. The claim was introduced
+# by assumption while writing the deploy table and would have cost a deployer
+# ~7.5 GB of unnecessary download on every cold start.
+#
+# The check derives the answer from the code rather than restating it, so the
+# README cannot drift from what the modes actually do.
+
+
+def _modes_that_transcribe() -> set[str]:
+    """Which `prepare_*` functions call `run_stage`, read from the source."""
+    import ast
+
+    tree = ast.parse((WORKER_DIR / "modes.py").read_text(encoding="utf-8"))
+    calling: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef) or not node.name.startswith("prepare_"):
+            continue
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name) and sub.func.id == "run_stage":
+                calling.add(node.name.removeprefix("prepare_"))
+    return calling
+
+
+def test_only_cover_transcribes() -> None:
+    """Pins the fact the README got wrong, from the code rather than a doc."""
+    transcribing = _modes_that_transcribe()
+    assert transcribing == {"cover"}, (
+        f"the modes calling run_stage are {sorted(transcribing)}. The README's "
+        "cached-models table says which modes need each repo, and it is derived "
+        "from this — update both together."
+    )
+
+
+def test_the_readme_marks_the_transcription_repos_as_cover_only() -> None:
+    """And the README must agree with that derivation.
+
+    A repo listed as needed by a mode that never loads it is a download a
+    deployer pays for on every cold start and never uses.
+    """
+    text = _readme()
+    for repo in ("m-a-p/SheetSage2", "m-a-p/MERT-v2-FullSong", "Qwen/Qwen3-ASR-1.7B"):
+        row = next((ln for ln in text.splitlines() if repo in ln and "|" in ln), None)
+        assert row, f"{repo} is not in the README's cached-models table"
+        assert "`cover` only" in row, (
+            f"{repo}'s row does not mark it cover-only: {row.strip()!r}. "
+            "`edit` re-renders a supplied score and never transcribes."
+        )
+    assert "Only `cover` transcribes" in text, (
+        "the README does not state which modes transcribe, so the table's "
+        "'Needed by' column is the only signal and it has been wrong before"
+    )

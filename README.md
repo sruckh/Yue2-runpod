@@ -306,11 +306,16 @@ holds a single HuggingFace repo; the worker caches five:
 
 | Repo | Needed by | Size |
 |---|---|---|
-| `m-a-p/YuE2-3B` | all modes | 7.3 GB |
-| `m-a-p/YuE2-Vae` | all modes | 0.5 GB |
-| `m-a-p/SheetSage2` | `cover`, `edit` | 0.2 GB |
-| `m-a-p/MERT-v2-FullSong` | `cover` — SheetSage2's encoder parent | 2.5 GB |
-| `Qwen/Qwen3-ASR-1.7B` | `cover` | 4.7 GB |
+| `m-a-p/YuE2-3B` | all three modes | 7.3 GB |
+| `m-a-p/YuE2-Vae` | all three modes | 0.5 GB |
+| `m-a-p/SheetSage2` | **`cover` only** | 0.2 GB |
+| `m-a-p/MERT-v2-FullSong` | **`cover` only** — SheetSage2's encoder parent | 2.5 GB |
+| `Qwen/Qwen3-ASR-1.7B` | **`cover` only** | 4.7 GB |
+
+**Only `cover` transcribes.** `edit` re-renders a score it is given (or one it asks
+the model to plan) and never invokes either transcription family — `prepare_edit`
+makes no subprocess calls. So a deployment that only ever runs `create` and `edit`
+does not need the last three repos, and the first cold start is ~7.5 GB lighter.
 
 Pointing the cached-model slot at `m-a-p/YuE2-3B` (the largest) and letting the
 worker download the rest into the volume is the intended arrangement. Those ~8 GB
@@ -351,7 +356,9 @@ given their own virtual environments, on the assumption their pins could not
 coexist with YuE2's torch 2.10.0 / numpy 2.2.6. That assumption was tested and was
 wrong: both run correctly on the main stack — verified on hardware, including a
 SheetSage2 transcription of 168 notes with the chord symbols correctly absent. The
-venvs were removed, and the image is ~6.5 GB smaller for it.
+venvs were removed. The layers carrying them measured 3.32 GB and
+3.18 GB in the build log, so the image lost ~6.5 GB — the collapsed image itself
+has not been weighed, since images are only built on RunPod's platform.
 
 **What remains is the process boundary, and that is the part that matters.** Each
 model family still runs as its own subprocess, which returns its VRAM to the
