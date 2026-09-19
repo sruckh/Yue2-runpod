@@ -301,7 +301,7 @@ Optional environment variables: `VOLUME_ROOT`, `MEMORY_BUDGET_GIB`,
 | Endpoint setting | Value | Why |
 |---|---|---|
 | GPU | any 24 GB card, ×1 | measured peaks 8.3–9.1 GiB; one song at a time |
-| Container disk | 30 GB | the image was 10.8 GB with two torch stacks; the venv collapse removes ~6.5 GB of that, so 20 GB is ample |
+| Container disk | 30 GB | the image was 10.8 GB with two extra torch stacks; 20 GB is ample either way |
 | Job timeout | ≥ 30 min | generation plus model load, with headroom |
 | Network volume | `/runpod-volume` | datacenter-specific — endpoint and volume must share a DC |
 
