@@ -256,6 +256,12 @@ def prepare_cover(params: SongParameters, workdir: Path) -> ModeResult:
         "error": asr.error,
         "used": not params.lyrics_supplied,
         "reason": "caller supplied lyrics" if params.lyrics_supplied else "transcribed",
+        # The language the model detected in the recording. It was already
+        # computed and discarded here — the child has returned it all along — so
+        # this is a pass-through rather than new work. The official demo shows a
+        # language field; ours reports what the model found rather than what a
+        # caller set, which is the only version that can be honest for a cover.
+        "language": (asr.payload or {}).get("language"),
         # Which stack produced this transcription. `cover` can run the ASR stage
         # under its own venv or the main environment, and the response is
         # otherwise identical — so without this the unification experiment cannot

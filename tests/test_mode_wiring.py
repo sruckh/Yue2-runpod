@@ -311,3 +311,53 @@ def test_both_stages_still_report_their_environment() -> None:
     root = Path(__file__).resolve().parent.parent / "worker"
     for child in ("transcribe_asr/run.py", "transcribe_sheetsage/run.py"):
         assert "_environment()" in (root / child).read_text(encoding="utf-8")
+
+
+def _stage_record_source(stage: str) -> str:
+    """The `stages["<stage>"] = {…}` literal from modes.py, as written.
+
+    Scoped to one stage on purpose. A file-wide substring check passes even after
+    a field is deleted from one stage, because the other stage still has it —
+    which is exactly how an earlier version of these tests reported success
+    against a broken change.
+
+    Slices to the matching close brace by brace-counting rather than to the first
+    `}`, because the field values contain braces: `(asr.payload or {})`.
+    """
+    source = (Path(__file__).resolve().parent.parent / "worker" / "modes.py").read_text(encoding="utf-8")
+    start = source.index(f'stages["{stage}"] = {{')
+    depth = 0
+    for i in range(start, len(source)):
+        if source[i] == "{":
+            depth += 1
+        elif source[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return source[start : i + 1]
+    raise AssertionError(f"unbalanced braces while reading the {stage} stage record")
+
+
+def test_the_detected_language_reaches_the_response() -> None:
+    """The child computed it; the parent must not drop it.
+
+    `transcribe_asr/run.py` returns `{"text": ..., "language": ...}` and the
+    language was being discarded between the child and `stages["asr"]` — computed
+    work thrown away at the boundary. The official demo surfaces a language field;
+    for a cover the only honest version is the detected one, since no caller sets
+    it.
+    """
+    record = _stage_record_source("asr")
+    assert '"language"' in record, "modes.py drops the ASR-detected language"
+
+
+def test_the_language_comes_from_the_child_not_the_request() -> None:
+    """It must be the payload's value, not a field the caller supplied.
+
+    If this ever read from `params`, a cover would report the caller's assumption
+    rather than what the recording actually contains.
+    """
+    record = _stage_record_source("asr")
+    assert "asr.payload" in record, "the language does not come from the child's result"
+    assert "params." not in record.split('"language"')[1].split("\n")[0], (
+        "the language is read from the request, not the transcription"
+    )

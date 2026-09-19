@@ -60,8 +60,12 @@ generating:
 
 ```jsonc
 // cover
-"stages": { "sheetsage": { "ok": true, "seconds": 22.4 },
-            "asr":       { "ok": true, "seconds": 78.4, "used": true, "reason": "transcribed" } }
+"stages": {
+  "sheetsage": { "ok": true, "seconds": 22.4, "environment": { … } },
+  "asr":       { "ok": true, "seconds": 78.4, "used": true,
+                 "reason": "transcribed",
+                 "language": "English",          // detected in the recording
+                 "environment": { "torch": "2.10.0+cu128", … } } }
 
 // edit
 "stages": { "score": { "source": "supplied" } }   // or "plan" when no abc was sent
@@ -69,6 +73,26 @@ generating:
 
 The response carries **URLs and metadata, never audio bytes**. A full song does
 not belong in a job response, and polling stays cheap.
+
+### Reading Key, Meter and Tempo
+
+There are **no `key`, `meter` or `tempo` request fields**, and no response fields
+either — YuE2's own request schema has exactly seven inputs (`style`, `lyrics`,
+`cot`, `seed`, `abc`, `cfg_scale`, `id`) and the official demo does not accept
+them as input. The demo's "Key Cm · Meter 4/4 · Tempo 145 BPM" row is *parsed from
+the score it just generated*.
+
+So a UI should read them off `score_abc_url`, which is where they live:
+
+    M:4/4          meter
+    Q:1/4=145      tempo, in quarter-notes per minute
+    K:Cm           key
+
+That is a client-side parse of the ABC — a few lines of regex — not an API call.
+They are properties of what the model wrote, not knobs on the request.
+
+**`language` is different, and is in the response** — under `stages.asr.language`
+for a cover, because it is *detected* from the recording rather than chosen.
 
 ### Fields
 
