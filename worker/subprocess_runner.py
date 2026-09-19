@@ -152,7 +152,12 @@ def run_stage(
     env["PYTHONPATH"] = ""  # never let the child see this worker's modules
     env["PYTHONUNBUFFERED"] = "1"
 
-    log.info("%s: running %s in its own environment", name, entrypoint.name)
+    # The log line names the interpreter, not a fixed phrase. It used to read
+    # "in its own environment", which was true while each model family had its own
+    # venv and became misleading once they moved into the main one — a reader
+    # chasing configuration would go looking for a venv that no longer exists. The
+    # path is the fact; the phrase was a description of a design that changed.
+    log.info("%s: running %s under %s", name, entrypoint.name, python)
     started = time.perf_counter()
     try:
         completed = subprocess.run(
