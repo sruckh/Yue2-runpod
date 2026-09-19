@@ -4,40 +4,32 @@ Generate full songs — vocals and accompaniment — from a style prompt and lyr
 on a single 24 GB GPU. Built on [YuE2-3B](https://huggingface.co/m-a-p/YuE2-3B):
 symbolic planning first, then realization, 48 kHz stereo, no quantization.
 
-This is **Stage 02** of the project's ICM pipeline: create mode, end to end.
-Cover and edit modes are Stage 03.
+**All three modes are implemented and verified end to end on hardware.** The API
+contract — request fields, response shape, artifact keys, error kinds — lives in
+the repository root `README.md`; this file covers the worker's internals.
 
 ## What it does
 
 One job in, one song out.
 
 ```jsonc
-// POST /run — input
+// POST /run — input. Full field table in the root README.
 {
   "input": {
-    "style": "City Pop, upbeat, groovy bass, electric guitar, neon city night",
+    "mode":   "create",   // "create" | "cover" | "edit"  — default "create"
+    "style":  "City Pop, upbeat, groovy bass, electric guitar, neon city night",
     "lyrics": "[Verse]\nStreetlights blink, watching every passer-by\n[Chorus]\nTonight we stay awake",
-    "cot": "full",        // "full" | "melody" | "off"   (default "full")
-    "seed": 12300,        // optional, default 831001
+    "cot":    "full",     // "full" | "melody" | "off"   (default "full")
+    "seed":   12300,      // optional, default 831001
     "cfg_scale": 1.2,     // optional, [0, 20]
-    "abc": "X:1\n..."     // optional, supply your own score (needs cot != "off")
+    "abc":    "X:1\n...",  // optional score; requires cot != "off"
+    "instrumental": false // optional; true fills the lyrics slot, see root README
   }
 }
 ```
 
-```jsonc
-// response
-{
-  "audio_url":     "https://…/audio.flac",   // presigned, 7-day default
-  "score_abc_url": "https://…/score.abc",    // the planned score
-  "duration":      214.85,                   // seconds of audio
-  "seed":          12300,
-  "cot":           "full",
-  "decoder":       "m-a-p/YuE2-Vae",
-  "timings":       { "abc": …, "semantic": …, "nar_seconds": … },
-  "artifact_urls": { … }                     // every artifact, incl. result.json
-}
-```
+The response adds `mode`, `stages` (cover/edit), `vram`, `truncated`,
+`truncation_by_stage`, `elapsed_seconds` and `request` to the fields below.
 
 The response carries **URLs and metadata, never raw bytes** — a 48 kHz stereo
 FLAC does not belong in a job response.
@@ -46,17 +38,25 @@ FLAC does not belong in a job response.
 
 ```
 worker/
-├── handler.py       RunPod entrypoint; boots at import, generates per job
-├── boot.py          Idempotent weight caching onto the network volume
-├── schema.py        Job validation, mirroring the pipeline's own bounds
-├── storage.py       Backblaze B2 egress over the S3 API
-├── config.py        Environment-driven settings
-├── requirements.txt Exact pins — never a loose range (see below)
-└── .runpod/         Endpoint config and example job payloads
+├── handler.py         RunPod entrypoint; boots at import, generates per job
+├── boot.py            Idempotent weight caching onto the network volume
+├── schema.py          Job validation, mirroring the pipeline's own bounds
+├── storage.py         Backblaze B2 egress over the S3 API
+├── config.py          Environment-driven settings
+├── modes.py           create | cover | edit dispatch
+├── abc_score.py       ABC validation and chord stripping
+├── subprocess_runner.py  Runs one model family as its own subprocess
+├── vram.py            Device-wide memory sampling, per job
+├── check_env.py       Asserts the environment matches its pins
+├── transcribe_sheetsage/  audio -> melody.abc  (subprocess entrypoint)
+├── transcribe_asr/        audio -> lyrics.txt  (subprocess entrypoint)
+├── requirements.txt   Exact pins — never a loose range
+└── .runpod/           Endpoint config and example job payloads
 
-Dockerfile            At the REPO ROOT (RunPod's GitHub build looks there by
-                      default). python:3.12-slim + libsndfile1 + ffmpeg.
-tests/               173 tests, GPU and B2 both mocked
+Dockerfile             At the REPO ROOT (RunPod's GitHub build looks there by
+                       default). python:3.11-slim-trixie + libsndfile1 + ffmpeg
+                       + gcc, which triton needs at runtime.
+tests/                 GPU and B2 both mocked — runs with no hardware
 ```
 
 The modules use **flat imports** (`import config`, not `from worker import config`)
@@ -70,7 +70,7 @@ and getting that order wrong puts a 12 GB download on a 20 GB container disk.
 ### Locally (no GPU needed)
 
 ```bash
-python -m pytest tests/ -q          # 173 tests, no GPU, no network, no credentials
+python -m pytest tests/ -q          # no GPU, no network, no credentials
 ruff check worker tests && ruff format --check worker tests
 ```
 
@@ -90,22 +90,31 @@ generation is real.
 
 | Setting | Value | Why |
 |---|---|---|
-| GPU | RTX 4090 24 GB (ADA_24), ×1 | Peak is 14.08 GiB; one song at a time |
+| GPU | any 24 GB card, ×1 | Measured peaks 8.3–9.1 GiB; one song at a time |
 | Workers | min 0, scale after warm | Cold start pays the weight download |
-| Job timeout | ≥ 30 min | ~71 s generation for a 3.6-min song, plus slow boots |
-| Container disk | **30 GB** | The image alone is 12.9 GB — see below |
+| Job timeout | ≥ 30 min | ~40–70 s generation, plus a slow first boot |
+| Container disk | **30 GB** | The image is a few GB once pulled — see below |
 | Network volume | mounted at `/runpod-volume` | One datacenter — the volume is DC-specific |
-| Cached models | `m-a-p/YuE2-3B`, `m-a-p/YuE2-Vae` | Lets RunPod fetch the weights instead of the worker; the worker falls back to downloading if these are unset |
+| Cached models | `m-a-p/YuE2-3B` | RunPod's cached-models feature holds **one** repo. The worker caches all five into the volume and downloads the rest on first boot |
 
-The image measures **12.9 GB**, dominated by the `nvidia` CUDA pip wheels (4.3 GB)
-that `torch` pulls in, plus `torch` itself (1.8 GB). The original 20 GB container
-disk left too little room for the pull/unpack phase, so the endpoint config asks
-for 30. **No model weights are baked in** — that is verified from inside the built
-container, not assumed.
+**The GPU list may name several 24 GB types; the worker runs on whichever the pool
+provides.** The pool is not homogeneous — the same endpoint has reported device
+totals of 23034 MiB and 24564 MiB from cards sold as the same tier, and host RAM
+has varied between 126 GB and 507 GB across workers. Quote the card alongside any
+peak you record.
 
-Stage 03 will grow this considerably: SheetSage2 and Qwen3-ASR each get their own
-venv with their own torch (2.8.0 and unpinned respectively), so expect to raise
-the container disk again.
+**Peak VRAM scales with song length.** A 57 s song measured 8.5 GiB; a 197 s song
+measured 9.1 GiB; the published 14.08 GiB figure was a ~3.6-minute song at full
+context. Compare like with like.
+
+**No model weights are baked in** — verified from inside the built container by a
+build-time guard, not assumed.
+
+The image was **10.8 GB** while SheetSage2 and Qwen3-ASR each had their own venv
+with their own torch stack. Both venvs were removed after the unification
+experiment showed both families run correctly on the main stack (verified on
+hardware), taking ~6.5 GB with them. The 20 GB container disk that was too small
+now has ample room.
 
 ### Environment
 
@@ -116,7 +125,9 @@ B2_ENDPOINT_URL   B2_KEY_ID   B2_APP_KEY   B2_BUCKET
 ```
 
 Set them on the **endpoint template**, never in the image — a key baked into a
-Dockerfile persists in the layers forever. The B2 key needs `writeFiles` on the
+Dockerfile persists in the layers forever. Note that RunPod's config API reports
+only *some* of an endpoint's env vars; a variable missing from the API response is
+not necessarily missing from the container. The B2 key needs `writeFiles` on the
 bucket; it never needs `listBuckets`, because nothing here enumerates.
 
 Once the volume is warm, set `HF_LOCAL_FILES_ONLY=true` so a missing blob fails

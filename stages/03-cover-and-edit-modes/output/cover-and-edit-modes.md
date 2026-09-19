@@ -7,6 +7,20 @@
 
 **Built and statically verified. Awaiting the stage's `## Human check`.**
 
+> **Addendum, 2026-09-19 — the check passed.** This section is the record as
+> written when the build finished, and is left as written. Both modes have since
+> run on hardware:
+>
+> | Job | Mode | Result | Peak |
+> |---|---|---|---|
+> | `0b424184` | cover | COMPLETED | 9270 MiB |
+> | `471bda93` | edit | COMPLETED | 9348 MiB |
+>
+> Neither exceeded the create peak for the same song, and `edit` retained the
+> chord symbols of its supplied score. The test count below (281) is also a
+> snapshot — the suite is larger now. Current state: the root `README.md` under
+> *Current scope* and `shared/vram-budget.md` for measured peaks.
+
 | Check | Result |
 |---|---|
 | Test suite | 281 passing (was 188) — no GPU, no network, no model libraries |
@@ -21,9 +35,13 @@
 |---|---|
 | `worker/modes.py` | Mode dispatch; the cover and edit pipelines |
 | `worker/abc_score.py` | ABC validation and chord stripping, adapted from upstream (Apache 2.0) |
-| `worker/subprocess_runner.py` | Runs a model family in its own venv; file-based protocol |
-| `worker/transcribe_sheetsage/run.py` | Melody transcription, executed in the sheetsage2 venv |
-| `worker/transcribe_asr/run.py` | Lyric transcription, executed in the qwen3-asr venv |
+| `worker/subprocess_runner.py` | Runs a model family as its own subprocess; file-based protocol |
+| `worker/transcribe_sheetsage/run.py` | Melody transcription, subprocess entrypoint |
+| `worker/transcribe_asr/run.py` | Lyric transcription, subprocess entrypoint |
+
+_(Row text updated 2026-09-19: they read "in its own venv" / "executed in the
+… venv" as written. The venvs were removed the next day — see the addendum at the
+top. The process boundary these rows describe is unchanged.)_
 | `Dockerfile` | Builds both venvs into the image |
 | `tests/test_modes.py`, `tests/test_abc_score.py`, `tests/test_mode_wiring.py`, `tests/test_review_regressions_stage03.py` | 93 new tests |
 
@@ -74,7 +92,10 @@ is not a cover.
    and the subprocess runner are separate modules because both are independently
    testable and both carry logic worth isolating. `abc_score` in particular
    enforces the format contract the whole cover path depends on.
-2. **The venv layout is `/opt/venvs/<family>/`, not under `worker/`.** The
+2. **The venv layout was `/opt/venvs/<family>/`, not under `worker/`.** _(Updated
+   2026-09-19: both venvs were removed; there is one environment. The path point
+   below still explains why they were never put under `worker/`, which is worth
+   keeping if one is ever needed again.)_ The
    contract said `worker/transcribe_sheetsage/` and `worker/transcribe_asr/` hold
    the subprocess code, which they do — but the *environments* are built to
    `/opt/venvs/` so that `COPY worker/ /app/` does not overwrite them and so the

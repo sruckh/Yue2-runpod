@@ -56,10 +56,14 @@ abc = result["abc"]  # chord-free melody ABC, also saved as cover-score/score.ab
 - Built on `m-a-p/MERT-v2-FullSong` (632M params, F32) as a base model, with a
   57.2M-param F32 adapter that merges automatically on load — **both** repos
   must be cached.
-- Requires Python 3.10 or 3.11 + FFmpeg 6.1 with shared libraries. Quick-start
-  pins: `torch==2.8.0`, `torchaudio==2.8.0` (cu126 index). Its own
-  `requirements.txt` has not been fetched yet — see `dependency-pins.md` open
-  question.
+- Requires Python 3.10 or 3.11 + FFmpeg 6.1 with shared libraries. Its own
+  `requirements.txt` pins `torch==2.8.0`, `torchaudio==2.8.0` (cu126 index),
+  `transformers==4.45.2`, `numpy==1.24.3`, `scipy==1.13.1`, `mir_eval==0.8.2`,
+  `pretty_midi==0.2.10`, `mido==1.3.3`, `setuptools==78.1.1`.
+- **Those pins are not binding.** SheetSage2 runs correctly on the main
+  environment's torch 2.10.0 / transformers 4.57.6 / numpy 2.2.6 — verified on
+  hardware 2026-09-19 (96–168 note melodies, chord symbols correctly absent
+  under `cot="melody"`). The pins describe what it was tested with upstream.
 - Weights: CC BY-NC 4.0. Not covered by YuE2's license grant — confirm terms
   separately before any commercial use.
 
