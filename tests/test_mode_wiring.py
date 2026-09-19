@@ -235,228 +235,79 @@ def test_cover_reaches_the_mode_with_a_local_path(
 
 
 # =============================================================================
-# The ASR environment toggle (unification experiment)
+# Both model families run in the main environment
 # =============================================================================
 #
-# `cover`'s lyric transcription normally runs in `/opt/venvs/qwen3-asr`. The
-# unification question is whether it can run under YuE2's own stack instead. It
-# is a runtime switch so one image answers both configurations, because flipping
-# the image and rebuilding costs a build cycle to test and another to revert.
+# The unification experiment is answered for both, verified on hardware:
+#
+#   ASR        job 0576cb7f, v25   reported torch 2.10.0+cu128
+#   SheetSage2 job f5792fce, v27   reported torch 2.10.0+cu128, transformers 4.57.6
+#
+# So the two venvs were deleted and these stages now run in the ONE environment.
+# The `run_stage` parameter remains — a future model family whose pins genuinely
+# conflict can still be given its own venv — but nothing uses it today, and these
+# tests pin that, because "one environment" is now a claim the image depends on.
 
 
-def test_the_asr_toggle_defaults_to_its_own_venv(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Unset means the isolated environment — the shipped, verified arrangement.
+def test_both_stages_run_in_the_main_interpreter() -> None:
+    """No venv indirection left for either stage.
 
-    The experiment must be opt-in. A default that changed behaviour would put
-    every cover job on the unverified path without anyone asking.
+    If a stage silently went back to a venv, the image would fail at runtime —
+    the venv is no longer built — and the failure would name a missing interpreter
+    path rather than a missing environment.
+
+    This checks the *constant* the stages use, not just the absent string
+    `/opt/venvs/...`. An earlier version of this guard only scanned for that
+    path, so setting `_ASR_ENV = "qwen3-asr"` — a venv name with no path in it —
+    passed while pointing the ASR stage at an environment the image does not
+    build. Caught by mutation, which is the only reason it is checked here.
     """
-    monkeypatch.delenv("YUE2_ASR_IN_MAIN", raising=False)
-    import modes
-
-    assert modes._asr_venv() == modes.ASR_VENV
-
-
-def test_the_asr_toggle_selects_the_main_interpreter(monkeypatch: pytest.MonkeyPatch) -> None:
     from subprocess_runner import MAIN_INTERPRETER
 
     import modes
 
-    for value in ("1", "true", "TRUE", "yes", " yes "):
-        monkeypatch.setenv("YUE2_ASR_IN_MAIN", value)
-        assert modes._asr_venv() == MAIN_INTERPRETER, f"{value!r} should enable the experiment"
+    assert modes._ASR_ENV == MAIN_INTERPRETER, (
+        f"the ASR stage points at {modes._ASR_ENV!r}; the image builds only the main environment"
+    )
+    assert modes._SHEETSAGE_ENV == MAIN_INTERPRETER, (
+        f"the SheetSage2 stage points at {modes._SHEETSAGE_ENV!r}; the image builds only the main environment"
+    )
+    assert modes._asr_venv() == MAIN_INTERPRETER
+    assert modes._sheetsage_venv() == MAIN_INTERPRETER
 
 
-def test_a_falsey_toggle_value_keeps_the_venv(monkeypatch: pytest.MonkeyPatch) -> None:
-    """`"false"` must not enable it. Same trap as the `instrumental` flag.
-
-    A string is not a boolean, and `bool("false")` is `True`. Here that would
-    silently move every cover onto the unverified path for a caller who wrote
-    what they believed meant "off".
-    """
-    import modes
-
-    for value in ("0", "false", "no", "", "off", "2"):
-        monkeypatch.setenv("YUE2_ASR_IN_MAIN", value)
-        assert modes._asr_venv() == modes.ASR_VENV, f"{value!r} must not enable the experiment"
-
-
-def test_the_main_interpreter_is_not_a_venv_path() -> None:
-    """The sentinel must resolve to the running interpreter, not a bogus path.
-
-    `VENV_ROOT / "" / "bin" / "python"` is a path that looks plausible and never
-    exists, so the failure would surface as a subprocess that cannot start rather
-    than as an obvious mistake.
-    """
+def test_the_main_interpreter_is_the_running_one() -> None:
+    """The sentinel must resolve to this interpreter, not a path under /opt/venvs."""
     import sys
 
     from subprocess_runner import MAIN_INTERPRETER, venv_python
 
-    assert MAIN_INTERPRETER == ""
     assert venv_python(MAIN_INTERPRETER) == Path(sys.executable)
+    assert "/opt/venvs" not in str(venv_python(MAIN_INTERPRETER))
 
 
-def test_the_asr_stage_still_runs_as_a_subprocess_either_way() -> None:
-    """Unification removes a *venv*, not the process boundary.
+def test_no_code_names_a_venv_the_image_no_longer_builds() -> None:
+    """The regression that matters after the collapse.
 
-    The boundary is what releases ASR's VRAM before generation — a cover's peak
-    depends on it. If this toggle ever made ASR run in-process, the measured
-    headroom would be gone.
+    The Dockerfile stopped building both venvs, so any code still naming one fails
+    only on a GPU node — with an error about a missing interpreter path rather
+    than a missing environment.
     """
-    source = (Path(__file__).resolve().parent.parent / "worker" / "modes.py").read_text(encoding="utf-8")
-    assert "run_stage(" in source
-    # The toggle selects an interpreter; it must not bypass run_stage.
-    assert "_asr_venv()" in source
+    root = Path(__file__).resolve().parent.parent / "worker"
+    offenders = []
+    for path in root.rglob("*.py"):
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if "opt/venvs/sheetsage2" in line or "opt/venvs/qwen3-asr" in line:
+                offenders.append(f"{path.relative_to(root)}: {line.strip()[:80]}")
+    assert not offenders, "code still names a venv the image no longer builds:\n" + "\n".join(offenders)
 
 
-# =============================================================================
-# The ASR stage must say which stack ran it
-# =============================================================================
-#
-# `cover` can run the ASR stage under two interpreters — its own venv, or the
-# main environment — and the job response is otherwise identical. Without the
-# child reporting its own environment, a successful cover cannot say which stack
-# produced the lyrics, which makes the unification experiment unanswerable from
-# its own result. A `COMPLETED` status would be consistent with both answers.
+def test_both_stages_still_report_their_environment() -> None:
+    """The reporting stayed useful after the experiment.
 
-
-def test_the_asr_child_reports_its_environment() -> None:
-    """The child is the authority: it knows which interpreter it is."""
-    source = (Path(__file__).resolve().parent.parent / "worker" / "transcribe_asr" / "run.py").read_text(
-        encoding="utf-8"
-    )
-    assert "_environment()" in source, "the ASR child does not report its environment"
-    for field in ("torch", "executable", "python"):
-        assert f'"{field}"' in source, f"the reported environment omits {field!r}"
-
-
-def test_the_reported_environment_includes_the_torch_version() -> None:
-    """Because that is the variable the experiment actually changes.
-
-    The venv resolved torch 2.14.0; the main environment pins 2.10.0. A
-    transcription that is subtly wrong because of that gap still returns 200, so
-    the version has to be visible beside the text.
+    It is now how a job says which stack ran — and it is what made the experiment
+    readable in the first place.
     """
-    source = (Path(__file__).resolve().parent.parent / "worker" / "transcribe_asr" / "run.py").read_text(
-        encoding="utf-8"
-    )
-    assert "torch.__version__" in source or "torch.__version__" in source
-
-
-def _stage_record_source(stage: str) -> str:
-    """The `stages["<stage>"] = {…}` literal, as written.
-
-    Scoped to one stage on purpose. An earlier version asserted that the string
-    `"environment"` appeared *somewhere* in `modes.py`, which passed even after
-    the field was deleted from a stage — because the other stage still had it.
-    A file-wide substring check is not a check on the thing named in the test.
-    """
-    source = (Path(__file__).resolve().parent.parent / "worker" / "modes.py").read_text(encoding="utf-8")
-    start = source.index(f'stages["{stage}"] = {{')
-    return source[start : source.index("}", start)]
-
-
-def test_the_parent_passes_the_environment_through() -> None:
-    """Reported but dropped is the same as not reported."""
-    for stage in ("asr", "sheetsage"):
-        assert '"environment"' in _stage_record_source(stage), (
-            f"modes.py drops the {stage} stage's environment instead of surfacing it"
-        )
-
-
-def test_a_failed_asr_stage_still_reports_its_environment() -> None:
-    """A *failed* experiment is the interesting one, and it needs the stack named.
-
-    If running under the main environment breaks, the error alone does not say so
-    — the failure path must carry the environment too.
-    """
-    source = (Path(__file__).resolve().parent.parent / "worker" / "transcribe_asr" / "run.py").read_text(
-        encoding="utf-8"
-    )
-    failure_block = source[source.index('"status": "failed"') :]
-    assert "environment" in failure_block, "the ASR failure path does not report its environment"
-
-
-# =============================================================================
-# The SheetSage2 toggle — the second unification experiment
-# =============================================================================
-#
-# ASR's is answered (it runs on the main stack, verified on hardware). This one
-# is not: the probe showed SheetSage2's *code loads* under the main stack, but
-# nothing has *run* it there, and its jump is larger — torch 2.8.0 and
-# transformers 4.45.2 against 2.10.0 and 4.57.6.
-
-
-def test_the_two_stages_have_independent_switches() -> None:
-    """One variable per stage, so neither forces the other to move.
-
-    ASR's experiment is answered and SheetSage2's is not. A single global switch
-    would mean reverting SheetSage2 also reverts the proven ASR change — or that
-    running the unproven one silently moves the proven one too.
-    """
-    import modes
-
-    assert modes._STAGE_IN_MAIN["asr"] != modes._STAGE_IN_MAIN["sheetsage"]
-    assert set(modes._STAGE_IN_MAIN) == {"asr", "sheetsage"}
-
-
-def test_sheetsage_defaults_to_its_own_venv(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("YUE2_SHEETSAGE_IN_MAIN", raising=False)
-    import modes
-
-    assert modes._sheetsage_venv() == modes.SHEETSAGE_VENV
-
-
-def test_sheetsage_switch_selects_the_main_interpreter(monkeypatch: pytest.MonkeyPatch) -> None:
-    from subprocess_runner import MAIN_INTERPRETER
-
-    import modes
-
-    for value in ("1", "true", "TRUE", "yes", " yes "):
-        monkeypatch.setenv("YUE2_SHEETSAGE_IN_MAIN", value)
-        assert modes._sheetsage_venv() == MAIN_INTERPRETER
-
-
-def test_the_sheetsage_switch_is_independent_of_the_asr_one(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Setting one must not move the other — that is the whole point."""
-    import modes
-
-    monkeypatch.delenv("YUE2_SHEETSAGE_IN_MAIN", raising=False)
-    monkeypatch.setenv("YUE2_ASR_IN_MAIN", "true")
-    assert modes._asr_venv() != modes.ASR_VENV
-    assert modes._sheetsage_venv() == modes.SHEETSAGE_VENV
-
-    monkeypatch.delenv("YUE2_ASR_IN_MAIN", raising=False)
-    monkeypatch.setenv("YUE2_SHEETSAGE_IN_MAIN", "true")
-    assert modes._asr_venv() == modes.ASR_VENV
-    assert modes._sheetsage_venv() != modes.SHEETSAGE_VENV
-
-
-def test_a_falsey_sheetsage_value_keeps_the_venv(monkeypatch: pytest.MonkeyPatch) -> None:
-    import modes
-
-    for value in ("0", "false", "no", "", "off"):
-        monkeypatch.setenv("YUE2_SHEETSAGE_IN_MAIN", value)
-        assert modes._sheetsage_venv() == modes.SHEETSAGE_VENV, f"{value!r} must not enable it"
-
-
-def test_the_sheetsage_child_reports_its_environment() -> None:
-    """Both torch and transformers, because both differ between the stacks.
-
-    The ASR child reports torch; this one has a wider gap and a second moving
-    part, so a wrong transcription needs both versions visible to be diagnosable.
-    """
-    source = (Path(__file__).resolve().parent.parent / "worker" / "transcribe_sheetsage" / "run.py").read_text(
-        encoding="utf-8"
-    )
-    assert "_environment()" in source
-    for field in ("torch", "transformers", "executable", "python"):
-        assert f'"{field}"' in source, f"the SheetSage2 environment omits {field!r}"
-
-
-def test_both_children_report_their_environment_on_failure_too() -> None:
-    """A failed experiment is the interesting one."""
     root = Path(__file__).resolve().parent.parent / "worker"
     for child in ("transcribe_asr/run.py", "transcribe_sheetsage/run.py"):
-        source = (root / child).read_text(encoding="utf-8")
-        failure_block = source[source.index('"status": "failed"') :]
-        assert "environment" in failure_block, f"{child} omits its environment on failure"
+        assert "_environment()" in (root / child).read_text(encoding="utf-8")

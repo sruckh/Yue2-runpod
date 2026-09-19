@@ -160,24 +160,25 @@ def test_no_apt_package_that_the_base_cannot_have(dockerfile: str) -> None:
 # =============================================================================
 
 
-def test_venv_paths_match_what_the_code_looks_for(dockerfile: str) -> None:
-    """The Dockerfile builds venvs where `subprocess_runner` looks for them.
+def test_no_venvs_are_built_and_the_runner_root_still_resolves(dockerfile: str) -> None:
+    """The image builds no venvs; the runner still knows where one would go.
 
-    Nothing at runtime checks this: a mismatch means `cover` fails with
-    "interpreter not found" on the first job, after a successful build.
+    Both model families run in the main environment, verified on hardware, so the
+    two venvs were deleted — together ~6.5 GB of a duplicated torch stack. The
+    `run_stage` parameter remains for a future family whose pins genuinely
+    conflict, so `VENV_ROOT` must still resolve; but a build that quietly created
+    one would be a 3 GB regression nobody asked for.
+
+    The scan skips comments. The Dockerfile *mentions* the removed venvs in a
+    comment explaining why they went, and matching that prose is how this
+    assertion first failed against a correct image.
     """
     import subprocess_runner
 
-    built = set(re.findall(r"python -m venv (/opt/venvs/\S+)", dockerfile))
-    assert built, "no venvs are built"
-    root = str(subprocess_runner.VENV_ROOT)
-    assert root == "/opt/venvs", f"VENV_ROOT is {root}, but the image builds into /opt/venvs"
-
-    # And the names the runner uses are among the ones built.
-    import modes
-
-    for name in (modes.SHEETSAGE_VENV, modes.ASR_VENV):
-        assert f"/opt/venvs/{name}" in built, f"{name} is not created by the Dockerfile"
+    instructions = "\n".join(ln for ln in dockerfile.splitlines() if not ln.lstrip().startswith("#"))
+    built = set(re.findall(r"python -m venv (/opt/venvs/\S+)", instructions))
+    assert not built, f"the image still builds venvs: {sorted(built)}"
+    assert str(subprocess_runner.VENV_ROOT) == "/opt/venvs"
 
 
 def test_child_entrypoints_are_copied_into_the_image(dockerfile: str) -> None:
@@ -363,25 +364,6 @@ def test_every_torch_in_the_image_is_pinned_to_something() -> None:
         assert "torch" in pins, f"{name} does not pin torch"
 
 
-def test_the_asr_requirements_are_installed_before_qwen_asr(dockerfile: str) -> None:
-    """Order matters: a satisfied pin stops pip re-picking torch.
-
-    Same reasoning as the sheetsage2 environment. Installing `qwen-asr` first
-    would let its tree choose torch, and the pin would then be a wish rather than
-    a constraint.
-    """
-    pinned_at = dockerfile.index("pip install --no-cache-dir -r /tmp/asr-requirements.txt")
-    qwen_at = dockerfile.index('pip install --no-cache-dir "qwen-asr==0.0.6"')
-    assert pinned_at < qwen_at, "qwen-asr is installed before the torch pin"
-
-
-def test_the_asr_environment_is_asserted_at_build_time(dockerfile: str) -> None:
-    """A pin that is never checked is a comment."""
-    assert "check_env.py --requirements /tmp/asr-requirements.txt" in dockerfile, (
-        "the Qwen3-ASR environment is installed but its pins are never verified"
-    )
-
-
 # =============================================================================
 # qwen-asr is installed outside the resolved requirements file
 # =============================================================================
@@ -405,57 +387,3 @@ def test_the_asr_environment_is_asserted_at_build_time(dockerfile: str) -> None:
 # loosen anything.
 
 REQUIREMENTS = REPO_ROOT / "worker" / "requirements.txt"
-
-
-def test_qwen_asr_is_not_in_the_resolved_requirements_file() -> None:
-    """Listing it there makes pip resolve its tree, which cannot succeed.
-
-    `accelerate==1.12.0` (qwen-asr) and `accelerate==1.13.0` (yue2_infer) are both
-    exact pins. pip cannot satisfy both, so the build aborts rather than choosing.
-    """
-    pins = dict(check_env.parse_requirements(REQUIREMENTS))
-    assert "qwen-asr" not in pins, (
-        "qwen-asr is in requirements.txt, which is installed with full dependency "
-        "resolution. Its accelerate pin conflicts with yue2_infer's and the build "
-        "will fail with ResolutionImpossible. Install it with --no-deps instead."
-    )
-
-
-def test_qwen_asr_is_installed_with_no_deps(dockerfile: str) -> None:
-    """And it must still actually be installed, or the experiment cannot run."""
-    assert 'pip install --no-cache-dir --no-deps "qwen-asr==0.0.6"' in dockerfile, (
-        "qwen-asr is not installed --no-deps anywhere, so the main environment "
-        "cannot import it and the unification toggle would fail at runtime"
-    )
-
-
-def test_the_no_deps_install_comes_after_the_requirements_file(dockerfile: str) -> None:
-    """Order is the mechanism: the pin must not be visible to the resolver.
-
-    If qwen-asr were installed before `requirements.txt`, pip would still resolve
-    the tree and still abort.
-    """
-    requirements_at = dockerfile.index("pip install --no-cache-dir -r /app/requirements.txt")
-    no_deps_at = dockerfile.index('--no-deps "qwen-asr==0.0.6"')
-    assert requirements_at < no_deps_at
-
-
-def test_the_no_deps_install_asserts_its_version(dockerfile: str) -> None:
-    """Nothing else checks it, since it is outside the pins file.
-
-    A version installed outside the file that `check_env` reads is a version
-    nothing verifies — the same shape as the unpinned torch this session already
-    fixed once.
-    """
-    assert "expected 0.0.6" in dockerfile, "the --no-deps install does not assert its version"
-
-
-def test_the_runtime_deps_of_qwen_asr_are_still_pinned() -> None:
-    """`--no-deps` means we supply them, so they must be in the resolved file.
-
-    Skipping the dependency tree is only safe while its real requirements are
-    satisfied by hand.
-    """
-    pins = dict(check_env.parse_requirements(REQUIREMENTS))
-    for dep in ("nagisa", "soynlp", "librosa"):
-        assert dep in pins, f"{dep} is needed by qwen_asr but no longer pinned"

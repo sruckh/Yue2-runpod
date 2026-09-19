@@ -25,6 +25,14 @@ import subprocess_runner
 from subprocess_runner import SubprocessError, run_stage, scratch_dir, venv_python, write_request
 
 import modes
+
+#: A venv name for exercising `run_stage` itself. The image builds no venvs —
+#: both model families run in the main environment — but the runner still takes a
+#: venv name, and these tests are about the runner, not about which environments
+#: exist. A literal here rather than a `modes` constant, because there is no
+#: longer a constant: the one that existed named a venv that is gone.
+SAMPLE_VENV = "sheetsage2"
+
 from modes import ModeError
 from schema import SongParameters
 
@@ -67,10 +75,9 @@ def fake_venv(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     attribute is enough — no reload needed.
     """
     root = tmp_path / "venvs"
-    for name in (modes.SHEETSAGE_VENV, modes.ASR_VENV):
-        bin_dir = root / name / "bin"
-        bin_dir.mkdir(parents=True)
-        (bin_dir / "python").write_text("#!/bin/sh\n")
+    bin_dir = root / SAMPLE_VENV / "bin"
+    bin_dir.mkdir(parents=True)
+    (bin_dir / "python").write_text("#!/bin/sh\n")
     monkeypatch.setattr(subprocess_runner, "VENV_ROOT", root)
     return root
 
@@ -128,14 +135,14 @@ def test_missing_interpreter_is_an_image_error(tmp_path: Path, monkeypatch: pyte
 def test_missing_entrypoint_is_an_image_error(fake_venv: Path, tmp_path: Path) -> None:
     write_request(tmp_path, {"audio": "x"})
     with pytest.raises(SubprocessError, match="entrypoint not found"):
-        run_stage(modes.SHEETSAGE_VENV, tmp_path / "absent.py", tmp_path, timeout_seconds=5)
+        run_stage(SAMPLE_VENV, tmp_path / "absent.py", tmp_path, timeout_seconds=5)
 
 
 def test_missing_request_file_is_an_error(fake_venv: Path, tmp_path: Path) -> None:
     entry = tmp_path / "run.py"
     entry.write_text("")
     with pytest.raises(SubprocessError, match=r"no request\.json"):
-        run_stage(modes.SHEETSAGE_VENV, entry, tmp_path, timeout_seconds=5)
+        run_stage(SAMPLE_VENV, entry, tmp_path, timeout_seconds=5)
 
 
 def test_a_successful_child_is_read_back(fake_venv: Path, tmp_path: Path, child) -> None:
@@ -148,7 +155,7 @@ def test_a_successful_child_is_read_back(fake_venv: Path, tmp_path: Path, child)
 
     child(handler)
     write_request(tmp_path, {"audio": "x"})
-    result = run_stage(modes.SHEETSAGE_VENV, entry, tmp_path, timeout_seconds=5)
+    result = run_stage(SAMPLE_VENV, entry, tmp_path, timeout_seconds=5)
 
     assert result.ok
     assert result.payload["abc"] == "X:1\n"
@@ -162,7 +169,7 @@ def test_request_is_not_treated_as_an_artifact(fake_venv: Path, tmp_path: Path, 
     entry.write_text("")
     child(lambda request, workdir: {"status": "complete"})
     write_request(tmp_path, {"audio": "x"})
-    result = run_stage(modes.SHEETSAGE_VENV, entry, tmp_path, timeout_seconds=5)
+    result = run_stage(SAMPLE_VENV, entry, tmp_path, timeout_seconds=5)
     assert "request.json" not in result.artifacts
 
 
@@ -172,7 +179,7 @@ def test_nonzero_exit_without_a_result_is_a_failure(fake_venv: Path, tmp_path: P
     entry.write_text("")
     monkeypatch.setattr(subprocess_runner.subprocess, "run", lambda *a, **k: FakeCompleted(1, stderr="Killed"))
     write_request(tmp_path, {"audio": "x"})
-    result = run_stage(modes.SHEETSAGE_VENV, entry, tmp_path, timeout_seconds=5)
+    result = run_stage(SAMPLE_VENV, entry, tmp_path, timeout_seconds=5)
 
     assert not result.ok
     assert result.returncode == 1
@@ -194,7 +201,7 @@ def test_status_failed_is_not_success_even_on_exit_zero(fake_venv: Path, tmp_pat
 
     monkeypatch.setattr(subprocess_runner.subprocess, "run", fake_run)
     write_request(tmp_path, {"audio": "x"})
-    result = run_stage(modes.SHEETSAGE_VENV, entry, tmp_path, timeout_seconds=5)
+    result = run_stage(SAMPLE_VENV, entry, tmp_path, timeout_seconds=5)
 
     assert not result.ok
     assert "no ABC" in (result.error or "")
@@ -209,7 +216,7 @@ def test_timeout_is_reported_as_a_budget_failure(fake_venv: Path, tmp_path: Path
 
     monkeypatch.setattr(subprocess_runner.subprocess, "run", timeout)
     write_request(tmp_path, {"audio": "x"})
-    result = run_stage(modes.SHEETSAGE_VENV, entry, tmp_path, timeout_seconds=5)
+    result = run_stage(SAMPLE_VENV, entry, tmp_path, timeout_seconds=5)
 
     assert not result.ok
     assert "budget" in (result.error or "")
@@ -233,7 +240,7 @@ def test_child_does_not_inherit_the_parent_pythonpath(fake_venv: Path, tmp_path:
 
     monkeypatch.setattr(subprocess_runner.subprocess, "run", fake_run)
     write_request(tmp_path, {"audio": "x"})
-    run_stage(modes.SHEETSAGE_VENV, entry, tmp_path, timeout_seconds=5)
+    run_stage(SAMPLE_VENV, entry, tmp_path, timeout_seconds=5)
 
     assert seen.get("PYTHONPATH") == ""
     # And it does inherit the HF cache, or the child would re-download the very

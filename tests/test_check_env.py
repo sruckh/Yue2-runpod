@@ -290,10 +290,13 @@ def test_the_dockerfile_runs_the_checker_in_every_environment() -> None:
 
     The checks this replaced printed versions and could not fail, so a venv that
     resolved the wrong torch reported the wrong number and the build passed.
+
+    There is now one environment to check. The two model-family venvs were
+    removed after the unification experiment answered yes for both — verified on
+    hardware, not inferred — so there are no longer separate pins files for the
+    builder to check them against.
     """
     dockerfile = (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
     assert "check_env.py" in dockerfile, "the checker is not run at build time"
-    # Against both pinned environments, not just one.
     assert "main-requirements.txt" in dockerfile
-    assert "sheetsage-requirements.txt" in dockerfile
     assert "print('sheetsage2'" not in dockerfile, "the print-only check is back"

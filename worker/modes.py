@@ -41,7 +41,6 @@ re-renders the whole song — the waveform outside the edit is **not** preserved
 from __future__ import annotations
 
 import logging
-import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -63,63 +62,38 @@ SHEETSAGE_ENTRYPOINT = Path(__file__).parent / "transcribe_sheetsage" / "run.py"
 ASR_ENTRYPOINT = Path(__file__).parent / "transcribe_asr" / "run.py"
 
 #: Virtual environment directory names, under `subprocess_runner.VENV_ROOT`.
-SHEETSAGE_VENV = "sheetsage2"
-ASR_VENV = "qwen3-asr"
-
-#: The switch that moves a stage into the main environment, per stage.
+#: Both model families now run in the **main** environment. There is one
+#: environment, not three.
 #:
-#: One variable per stage rather than one global, because the two are independent
-#: experiments with different risk. ASR is answered — it works, verified on
-#: hardware. SheetSage2 is unrun, and its jump is larger (torch 2.8.0 and
-#: transformers 4.45.2 against the main stack's 2.10.0 / 4.57.6). A single switch
-#: would force them to move together, so neither could be reverted alone.
-_STAGE_IN_MAIN = {
-    "asr": "YUE2_ASR_IN_MAIN",
-    "sheetsage": "YUE2_SHEETSAGE_IN_MAIN",
-}
-
-
-def _stage_venv(stage: str, default: str) -> str:
-    """Which environment runs `stage` — its own venv, or the main one.
-
-    The unification experiment: if a model family runs correctly on YuE2's stack,
-    its venv can be deleted and the image loses several GB and one environment.
-
-    It is a runtime switch rather than a rebuild so that one image answers both
-    configurations. The alternative — flipping the image and rebuilding — costs a
-    full build cycle to test, and a second to revert if the answer is no.
-
-    The subprocess boundary is unchanged either way: the stage still runs as a
-    child that exits before generation, so a cover's VRAM peak is unaffected.
-    Only the interpreter differs.
-    """
-    var = _STAGE_IN_MAIN[stage]
-    if os.environ.get(var, "").strip().lower() in {"1", "true", "yes"}:
-        return MAIN_INTERPRETER
-    return default
+#: Verified on hardware, 2026-09-19, rather than assumed:
+#:
+#:   ASR        job 0576cb7f, v25   env reported torch 2.10.0+cu128
+#:   SheetSage2 job f5792fce, v27   env reported torch 2.10.0+cu128,
+#:                                  transformers 4.57.6
+#:
+#: SheetSage2's own pins were torch 2.8.0 / transformers 4.45.2 / numpy 1.24.3 and
+#: qwen-asr had resolved torch 2.14.0, so both jumps are confirmed working. The
+#: SheetSage2 score was checked rather than trusted: 168 note tokens across two
+#: named melody voices and **zero chord symbols**, which is the melody-only
+#: contract — an empty or chords-carrying score would also have returned 200.
+#:
+#: `MAIN_INTERPRETER` is kept as the constant because it is what the subprocess
+#: runner understands, and the parameter remains: a future model family whose
+#: pins genuinely conflict can still be given its own venv by passing its name
+#: here. That was the original design and it is not wrong — it was simply
+#: unnecessary for these two.
+_SHEETSAGE_ENV = MAIN_INTERPRETER
+_ASR_ENV = MAIN_INTERPRETER
 
 
 def _asr_venv() -> str:
-    """ASR's environment. Answered yes: qwen_asr runs on the main stack.
-
-    Verified on hardware (job `0576cb7f`, endpoint v25) — the child reported
-    `executable=/usr/local/bin/python, torch=2.10.0+cu128` and transcribed
-    correctly. The venv is therefore removable; the switch is kept for now so the
-    two configurations remain testable side by side.
-    """
-    return _stage_venv("asr", ASR_VENV)
+    """ASR's interpreter. The main environment — see the note above."""
+    return _ASR_ENV
 
 
 def _sheetsage_venv() -> str:
-    """SheetSage2's environment. **Unrun in the main stack** — this is the test.
-
-    The unification probe showed the code *loads* under the main stack, but
-    nothing has *run* it there, and the jump is larger than ASR's: torch 2.8.0
-    and transformers 4.45.2 against the main stack's 2.10.0 and 4.57.6. Whether
-    it transcribes correctly is the open question, and only a cover job answers
-    it.
-    """
-    return _stage_venv("sheetsage", SHEETSAGE_VENV)
+    """SheetSage2's interpreter. The main environment — see the note above."""
+    return _SHEETSAGE_ENV
 
 
 #: Per-stage budgets. Transcription is bounded by song length; the checkpoints

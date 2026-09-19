@@ -182,43 +182,15 @@ RUN pip install --no-cache-dir --no-deps "qwen-asr==0.0.6" \
 
 # Requirements are vendored in the repository, not fetched from a URL at build
 # time: a fetched file makes the image depend on whatever is served that day.
-COPY worker/transcribe_sheetsage/requirements.txt /tmp/sheetsage-requirements.txt
-
-# torch comes from the CUDA 12.6 index, and goes in *before* the requirements
-# file. That file pins `torch==2.8.0` with no index, so letting it resolve from
-# PyPI would install the CPU-only build. Installed here first, those pins are
-# already satisfied and pip skips them.
+# BOTH VENVS WERE REMOVED 2026-09-19 — see "Why there is one environment now".
 #
-# NOTE: no comments inside the RUN chain below. Docker joins continued lines into
-# one shell command *before* running it, so a `#` mid-chain comments out
-# everything after it — including the following `&&`. Keeping the explanation out
-# here is correctness, not style.
-RUN python -m venv /opt/venvs/sheetsage2 \
-    && /opt/venvs/sheetsage2/bin/python -m pip install --no-cache-dir --upgrade pip \
-    && /opt/venvs/sheetsage2/bin/python -m pip install --no-cache-dir "huggingface-hub==0.36.0" \
-    && /opt/venvs/sheetsage2/bin/python -m pip install --no-cache-dir \
-         torch==2.8.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cu126 \
-    && /opt/venvs/sheetsage2/bin/python -m pip install --no-cache-dir -r /tmp/sheetsage-requirements.txt \
-    && rm -f /tmp/sheetsage-requirements.txt
-
-# Qwen3-ASR: the transformers backend, not vLLM. There is no concurrency need at
-# one-job-at-a-time, and the `vllm` extra would pull a second torch.
+# What used to be here: `python -m venv /opt/venvs/sheetsage2` installing torch
+# 2.8.0 from the cu126 index plus SheetSage2's pins, and `python -m venv
+# /opt/venvs/qwen3-asr` installing torch 2.14.0 plus qwen-asr. Together ~6.5 GB
+# of a duplicated torch stack, plus two `check_env` assertions and a summary line.
 #
-# `qwen-asr` pins transformers exactly but leaves torch to `accelerate`'s
-# `torch>=2.0.0`, so pip takes the newest available — 2.14.0 at the last build.
-# That version did real work (a 197 s cover, lyrics in 78.37 s), so it is pinned
-# here rather than left to the resolver: an image whose contents depend on the
-# day it was built is not reproducible, and nothing would report the drift.
-#
-# Installed in the same order as sheetsage2 and for the same reason — the pin is
-# satisfied first, so pip skips torch when it resolves qwen-asr's tree instead of
-# re-picking it. See worker/transcribe_asr/requirements.txt.
-COPY worker/transcribe_asr/requirements.txt /tmp/asr-requirements.txt
-RUN python -m venv /opt/venvs/qwen3-asr \
-    && /opt/venvs/qwen3-asr/bin/python -m pip install --no-cache-dir --upgrade pip \
-    && /opt/venvs/qwen3-asr/bin/python -m pip install --no-cache-dir -r /tmp/asr-requirements.txt \
-    && /opt/venvs/qwen3-asr/bin/python -m pip install --no-cache-dir "qwen-asr==0.0.6" \
-    && rm -f /tmp/asr-requirements.txt
+# Both are gone because the experiment that justified them came back negative for
+# the *need*: neither model family requires its own environment. See below.
 
 # --- verify all three environments -------------------------------------------------
 #
@@ -240,24 +212,16 @@ RUN python /tmp/check_env.py --requirements /tmp/main-requirements.txt
 
 # SheetSage2's environment, against its own vendored pins — this is where the
 # torch 2.8.0 pin lives, and where a mis-resolution is most likely.
-COPY worker/transcribe_sheetsage/requirements.txt /tmp/sheetsage-requirements.txt
-RUN /opt/venvs/sheetsage2/bin/python /tmp/check_env.py --requirements /tmp/sheetsage-requirements.txt
-
-# The Qwen3-ASR environment. It declares no torch pin, so there is nothing to
-# assert about which torch it resolved — the checker reports it. What *is*
-# asserted is that the package imports, which is the part a pin can speak to.
-# Now that torch is pinned here, the checker can assert it instead of reporting
-# it. The import check stays: a pin says nothing about whether the wheel loads.
-RUN /opt/venvs/qwen3-asr/bin/python -c "import qwen_asr" && echo "qwen3-asr: qwen_asr imports"
-COPY worker/transcribe_asr/requirements.txt /tmp/asr-requirements.txt
-RUN /opt/venvs/qwen3-asr/bin/python /tmp/check_env.py --requirements /tmp/asr-requirements.txt
+# The two model-family environments no longer exist, so neither has pins to
+# assert. What replaced those checks is below: an import of each family's package
+# in the ONE environment, which is the claim that now needs holding.
+RUN python -c "import qwen_asr; print('qwen_asr imports in the main environment')" \
+    && python -c "import mir_eval.chord, pretty_midi, mido; print('SheetSage2 deps import')"
 
 # A single summary of all three environments, so the build log states plainly
 # what it produced instead of leaving it scattered across three pip transcripts.
-RUN echo "=== installed environments ===" \
-    && python -c "import sys, importlib.metadata as m; print('  main       py', sys.version.split()[0], '| torch', m.version('torch'), '| transformers', m.version('transformers'), '| yue2-infer', m.version('yue2-infer'))" \
-    && /opt/venvs/sheetsage2/bin/python -c "import sys, importlib.metadata as m; print('  sheetsage2 py', sys.version.split()[0], '| torch', m.version('torch'), '| transformers', m.version('transformers'), '| numpy', m.version('numpy'))" \
-    && /opt/venvs/qwen3-asr/bin/python -c "import sys, importlib.metadata as m; print('  qwen3-asr  py', sys.version.split()[0], '| torch', m.version('torch'), '| transformers', m.version('transformers'))" \
+RUN echo "=== installed environment ===" \
+    && python -c "import sys, importlib.metadata as m; print('  main  py', sys.version.split()[0], '| torch', m.version('torch'), '| transformers', m.version('transformers'), '| yue2-infer', m.version('yue2-infer'), '| qwen-asr', m.version('qwen-asr'))" \
     && echo "=============================="
 
 # --- the unification experiment -----------------------------------------------------
