@@ -306,3 +306,56 @@ def test_the_asr_stage_still_runs_as_a_subprocess_either_way() -> None:
     assert "run_stage(" in source
     # The toggle selects an interpreter; it must not bypass run_stage.
     assert "_asr_venv()" in source
+
+
+# =============================================================================
+# The ASR stage must say which stack ran it
+# =============================================================================
+#
+# `cover` can run the ASR stage under two interpreters — its own venv, or the
+# main environment — and the job response is otherwise identical. Without the
+# child reporting its own environment, a successful cover cannot say which stack
+# produced the lyrics, which makes the unification experiment unanswerable from
+# its own result. A `COMPLETED` status would be consistent with both answers.
+
+
+def test_the_asr_child_reports_its_environment() -> None:
+    """The child is the authority: it knows which interpreter it is."""
+    source = (Path(__file__).resolve().parent.parent / "worker" / "transcribe_asr" / "run.py").read_text(
+        encoding="utf-8"
+    )
+    assert "_environment()" in source, "the ASR child does not report its environment"
+    for field in ("torch", "executable", "python"):
+        assert f'"{field}"' in source, f"the reported environment omits {field!r}"
+
+
+def test_the_reported_environment_includes_the_torch_version() -> None:
+    """Because that is the variable the experiment actually changes.
+
+    The venv resolved torch 2.14.0; the main environment pins 2.10.0. A
+    transcription that is subtly wrong because of that gap still returns 200, so
+    the version has to be visible beside the text.
+    """
+    source = (Path(__file__).resolve().parent.parent / "worker" / "transcribe_asr" / "run.py").read_text(
+        encoding="utf-8"
+    )
+    assert "torch.__version__" in source or "torch.__version__" in source
+
+
+def test_the_parent_passes_the_environment_through() -> None:
+    """Reported but dropped is the same as not reported."""
+    source = (Path(__file__).resolve().parent.parent / "worker" / "modes.py").read_text(encoding="utf-8")
+    assert '"environment"' in source, "modes.py drops the ASR environment instead of surfacing it"
+
+
+def test_a_failed_asr_stage_still_reports_its_environment() -> None:
+    """A *failed* experiment is the interesting one, and it needs the stack named.
+
+    If running under the main environment breaks, the error alone does not say so
+    — the failure path must carry the environment too.
+    """
+    source = (Path(__file__).resolve().parent.parent / "worker" / "transcribe_asr" / "run.py").read_text(
+        encoding="utf-8"
+    )
+    failure_block = source[source.index('"status": "failed"') :]
+    assert "environment" in failure_block, "the ASR failure path does not report its environment"

@@ -33,6 +33,7 @@ was considered and is not needed at this scale.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import sys
 from pathlib import Path
@@ -78,7 +79,35 @@ def run(request: dict, workdir: Path) -> dict:
         raise ValueError("transcription returned empty text")
 
     (workdir / "lyrics.txt").write_text(text + "\n", encoding="utf-8")
-    return {"status": "complete", "text": text, "language": detected}
+    return {"status": "complete", "text": text, "language": detected, "environment": _environment()}
+
+
+def _environment() -> dict:
+    """The stack this child actually ran on, for the parent to record.
+
+    **Why the child reports this rather than the parent inferring it.** `cover`
+    can run this stage under two different interpreters — its own venv, or the
+    main environment, selected by `YUE2_ASR_IN_MAIN` — and the job response looks
+    identical either way. A successful cover therefore cannot say which stack
+    produced the lyrics, which makes the unification experiment unanswerable from
+    its own result. Reporting it here means the answer travels with the output.
+
+    `torch` is included because the two environments differ in exactly that: the
+    venv resolved 2.14.0, the main environment pins 2.10.0. A transcription that
+    is subtly wrong because of the version gap would still return 200, so the
+    version needs to be visible beside the text.
+    """
+    import platform
+    import sys
+
+    import torch
+
+    return {
+        "executable": sys.executable,
+        "python": platform.python_version(),
+        "torch": torch.__version__,
+        "cuda": getattr(getattr(torch, "version", None), "cuda", None),
+    }
 
 
 def main() -> int:
@@ -92,7 +121,12 @@ def main() -> int:
         write_result(workdir, run(request, workdir))
         return 0
     except Exception as exc:
-        write_result(workdir, {"status": "failed", "type": type(exc).__name__, "error": str(exc)})
+        failure = {"status": "failed", "type": type(exc).__name__, "error": str(exc)}
+        # A failure to describe the environment must not replace the real
+        # failure — the caller needs the original cause most.
+        with contextlib.suppress(BaseException):
+            failure["environment"] = _environment()
+        write_result(workdir, failure)
         print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
         return 2
 

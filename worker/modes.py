@@ -247,6 +247,11 @@ def prepare_cover(params: SongParameters, workdir: Path) -> ModeResult:
         "error": asr.error,
         "used": not params.lyrics_supplied,
         "reason": "caller supplied lyrics" if params.lyrics_supplied else "transcribed",
+        # Which stack produced this transcription. `cover` can run the ASR stage
+        # under its own venv or the main environment, and the response is
+        # otherwise identical — so without this the unification experiment cannot
+        # be read from its own result. The child reports it; we pass it through.
+        "environment": (asr.payload or {}).get("environment"),
     }
 
     if params.lyrics_supplied:
