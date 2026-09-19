@@ -35,6 +35,7 @@ wrong song rather than an error.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import inspect
 import json
 import sys
@@ -49,6 +50,35 @@ DEFAULT_MODEL = "m-a-p/SheetSage2"
 # independently or offline mode makes it unreachable. `boot.CACHED_REPOS` covers
 # it; this note exists so the next reader does not have to re-derive the chain.
 MELODY_PROMPTS = ["timestamp", "downbeat_meter", "structure", "key", "melody_full"]
+
+
+def _environment() -> dict:
+    """The stack this child actually ran on, for the parent to record.
+
+    Mirrors the ASR child. `cover` can run this stage under its own venv or the
+    main environment, and the job response is otherwise identical — so without
+    this the unification experiment cannot be read from its own result. The child
+    is the authority: it knows which interpreter it is.
+
+    `torch` and `transformers` are both here because both differ between the two
+    environments, and the jump is larger than the ASR one: 2.8.0 / 4.45.2 in the
+    venv against 2.10.0 / 4.57.6 in main. A transcription that is subtly wrong
+    because of that gap still returns success, so the versions need to be visible
+    beside the score.
+    """
+    import platform
+    import sys
+
+    import torch
+    import transformers
+
+    return {
+        "executable": sys.executable,
+        "python": platform.python_version(),
+        "torch": torch.__version__,
+        "transformers": transformers.__version__,
+        "cuda": getattr(getattr(torch, "version", None), "cuda", None),
+    }
 
 
 def write_result(workdir: Path, payload: dict) -> None:
@@ -115,7 +145,12 @@ def run(request: dict, workdir: Path) -> dict:
         # file-based contract is broken and it should know now.
         saved.write_text(abc, encoding="utf-8")
 
-    return {"status": "complete", "abc": abc, "warnings": list(result.get("warnings") or [])}
+    return {
+        "status": "complete",
+        "abc": abc,
+        "warnings": list(result.get("warnings") or []),
+        "environment": _environment(),
+    }
 
 
 def main() -> int:
@@ -129,7 +164,13 @@ def main() -> int:
         write_result(workdir, run(request, workdir))
         return 0
     except Exception as exc:
-        write_result(workdir, {"status": "failed", "type": type(exc).__name__, "error": str(exc)})
+        failure = {"status": "failed", "type": type(exc).__name__, "error": str(exc)}
+        # A failed experiment is the interesting one, and an error that does not
+        # name the stack it ran on leaves the same question open. Suppressed so a
+        # failure to describe the environment cannot replace the real failure.
+        with contextlib.suppress(BaseException):
+            failure["environment"] = _environment()
+        write_result(workdir, failure)
         print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
         return 2
 

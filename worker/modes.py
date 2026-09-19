@@ -66,14 +66,24 @@ ASR_ENTRYPOINT = Path(__file__).parent / "transcribe_asr" / "run.py"
 SHEETSAGE_VENV = "sheetsage2"
 ASR_VENV = "qwen3-asr"
 
+#: The switch that moves a stage into the main environment, per stage.
+#:
+#: One variable per stage rather than one global, because the two are independent
+#: experiments with different risk. ASR is answered — it works, verified on
+#: hardware. SheetSage2 is unrun, and its jump is larger (torch 2.8.0 and
+#: transformers 4.45.2 against the main stack's 2.10.0 / 4.57.6). A single switch
+#: would force them to move together, so neither could be reverted alone.
+_STAGE_IN_MAIN = {
+    "asr": "YUE2_ASR_IN_MAIN",
+    "sheetsage": "YUE2_SHEETSAGE_IN_MAIN",
+}
 
-def _asr_venv() -> str:
-    """Which environment runs the ASR stage — its own venv, or the main one.
 
-    `YUE2_ASR_IN_MAIN=true` runs the ASR child under the *main* interpreter
-    instead of `/opt/venvs/qwen3-asr`. That is the unification experiment: if
-    qwen_asr runs correctly on YuE2's stack, the ASR venv can be deleted and the
-    image loses ~5 GB and one environment.
+def _stage_venv(stage: str, default: str) -> str:
+    """Which environment runs `stage` — its own venv, or the main one.
+
+    The unification experiment: if a model family runs correctly on YuE2's stack,
+    its venv can be deleted and the image loses several GB and one environment.
 
     It is a runtime switch rather than a rebuild so that one image answers both
     configurations. The alternative — flipping the image and rebuilding — costs a
@@ -81,12 +91,35 @@ def _asr_venv() -> str:
 
     The subprocess boundary is unchanged either way: the stage still runs as a
     child that exits before generation, so a cover's VRAM peak is unaffected.
-    Only the interpreter differs. See `worker/requirements.txt` for why the
-    accelerate pins do not block this.
+    Only the interpreter differs.
     """
-    if os.environ.get("YUE2_ASR_IN_MAIN", "").strip().lower() in {"1", "true", "yes"}:
+    var = _STAGE_IN_MAIN[stage]
+    if os.environ.get(var, "").strip().lower() in {"1", "true", "yes"}:
         return MAIN_INTERPRETER
-    return ASR_VENV
+    return default
+
+
+def _asr_venv() -> str:
+    """ASR's environment. Answered yes: qwen_asr runs on the main stack.
+
+    Verified on hardware (job `0576cb7f`, endpoint v25) — the child reported
+    `executable=/usr/local/bin/python, torch=2.10.0+cu128` and transcribed
+    correctly. The venv is therefore removable; the switch is kept for now so the
+    two configurations remain testable side by side.
+    """
+    return _stage_venv("asr", ASR_VENV)
+
+
+def _sheetsage_venv() -> str:
+    """SheetSage2's environment. **Unrun in the main stack** — this is the test.
+
+    The unification probe showed the code *loads* under the main stack, but
+    nothing has *run* it there, and the jump is larger than ASR's: torch 2.8.0
+    and transformers 4.45.2 against the main stack's 2.10.0 and 4.57.6. Whether
+    it transcribes correctly is the open question, and only a cover job answers
+    it.
+    """
+    return _stage_venv("sheetsage", SHEETSAGE_VENV)
 
 
 #: Per-stage budgets. Transcription is bounded by song length; the checkpoints
@@ -164,7 +197,7 @@ def prepare_cover(params: SongParameters, workdir: Path) -> ModeResult:
         },
     )
     melody = run_stage(
-        SHEETSAGE_VENV,
+        _sheetsage_venv(),
         SHEETSAGE_ENTRYPOINT,
         sheetsage_dir,
         timeout_seconds=SHEETSAGE_TIMEOUT_SECONDS,
@@ -174,6 +207,8 @@ def prepare_cover(params: SongParameters, workdir: Path) -> ModeResult:
         "ok": melody.ok,
         "seconds": round(melody.elapsed_seconds, 2),
         "error": melody.error,
+        # Which stack produced this score — see the note on the ASR stage below.
+        "environment": (melody.payload or {}).get("environment"),
     }
     if not melody.ok:
         raise ModeError(f"cover mode: melody transcription failed — {melody.error}")

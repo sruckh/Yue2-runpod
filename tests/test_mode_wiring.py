@@ -342,10 +342,25 @@ def test_the_reported_environment_includes_the_torch_version() -> None:
     assert "torch.__version__" in source or "torch.__version__" in source
 
 
+def _stage_record_source(stage: str) -> str:
+    """The `stages["<stage>"] = {…}` literal, as written.
+
+    Scoped to one stage on purpose. An earlier version asserted that the string
+    `"environment"` appeared *somewhere* in `modes.py`, which passed even after
+    the field was deleted from a stage — because the other stage still had it.
+    A file-wide substring check is not a check on the thing named in the test.
+    """
+    source = (Path(__file__).resolve().parent.parent / "worker" / "modes.py").read_text(encoding="utf-8")
+    start = source.index(f'stages["{stage}"] = {{')
+    return source[start : source.index("}", start)]
+
+
 def test_the_parent_passes_the_environment_through() -> None:
     """Reported but dropped is the same as not reported."""
-    source = (Path(__file__).resolve().parent.parent / "worker" / "modes.py").read_text(encoding="utf-8")
-    assert '"environment"' in source, "modes.py drops the ASR environment instead of surfacing it"
+    for stage in ("asr", "sheetsage"):
+        assert '"environment"' in _stage_record_source(stage), (
+            f"modes.py drops the {stage} stage's environment instead of surfacing it"
+        )
 
 
 def test_a_failed_asr_stage_still_reports_its_environment() -> None:
@@ -359,3 +374,89 @@ def test_a_failed_asr_stage_still_reports_its_environment() -> None:
     )
     failure_block = source[source.index('"status": "failed"') :]
     assert "environment" in failure_block, "the ASR failure path does not report its environment"
+
+
+# =============================================================================
+# The SheetSage2 toggle — the second unification experiment
+# =============================================================================
+#
+# ASR's is answered (it runs on the main stack, verified on hardware). This one
+# is not: the probe showed SheetSage2's *code loads* under the main stack, but
+# nothing has *run* it there, and its jump is larger — torch 2.8.0 and
+# transformers 4.45.2 against 2.10.0 and 4.57.6.
+
+
+def test_the_two_stages_have_independent_switches() -> None:
+    """One variable per stage, so neither forces the other to move.
+
+    ASR's experiment is answered and SheetSage2's is not. A single global switch
+    would mean reverting SheetSage2 also reverts the proven ASR change — or that
+    running the unproven one silently moves the proven one too.
+    """
+    import modes
+
+    assert modes._STAGE_IN_MAIN["asr"] != modes._STAGE_IN_MAIN["sheetsage"]
+    assert set(modes._STAGE_IN_MAIN) == {"asr", "sheetsage"}
+
+
+def test_sheetsage_defaults_to_its_own_venv(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("YUE2_SHEETSAGE_IN_MAIN", raising=False)
+    import modes
+
+    assert modes._sheetsage_venv() == modes.SHEETSAGE_VENV
+
+
+def test_sheetsage_switch_selects_the_main_interpreter(monkeypatch: pytest.MonkeyPatch) -> None:
+    from subprocess_runner import MAIN_INTERPRETER
+
+    import modes
+
+    for value in ("1", "true", "TRUE", "yes", " yes "):
+        monkeypatch.setenv("YUE2_SHEETSAGE_IN_MAIN", value)
+        assert modes._sheetsage_venv() == MAIN_INTERPRETER
+
+
+def test_the_sheetsage_switch_is_independent_of_the_asr_one(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Setting one must not move the other — that is the whole point."""
+    import modes
+
+    monkeypatch.delenv("YUE2_SHEETSAGE_IN_MAIN", raising=False)
+    monkeypatch.setenv("YUE2_ASR_IN_MAIN", "true")
+    assert modes._asr_venv() != modes.ASR_VENV
+    assert modes._sheetsage_venv() == modes.SHEETSAGE_VENV
+
+    monkeypatch.delenv("YUE2_ASR_IN_MAIN", raising=False)
+    monkeypatch.setenv("YUE2_SHEETSAGE_IN_MAIN", "true")
+    assert modes._asr_venv() == modes.ASR_VENV
+    assert modes._sheetsage_venv() != modes.SHEETSAGE_VENV
+
+
+def test_a_falsey_sheetsage_value_keeps_the_venv(monkeypatch: pytest.MonkeyPatch) -> None:
+    import modes
+
+    for value in ("0", "false", "no", "", "off"):
+        monkeypatch.setenv("YUE2_SHEETSAGE_IN_MAIN", value)
+        assert modes._sheetsage_venv() == modes.SHEETSAGE_VENV, f"{value!r} must not enable it"
+
+
+def test_the_sheetsage_child_reports_its_environment() -> None:
+    """Both torch and transformers, because both differ between the stacks.
+
+    The ASR child reports torch; this one has a wider gap and a second moving
+    part, so a wrong transcription needs both versions visible to be diagnosable.
+    """
+    source = (Path(__file__).resolve().parent.parent / "worker" / "transcribe_sheetsage" / "run.py").read_text(
+        encoding="utf-8"
+    )
+    assert "_environment()" in source
+    for field in ("torch", "transformers", "executable", "python"):
+        assert f'"{field}"' in source, f"the SheetSage2 environment omits {field!r}"
+
+
+def test_both_children_report_their_environment_on_failure_too() -> None:
+    """A failed experiment is the interesting one."""
+    root = Path(__file__).resolve().parent.parent / "worker"
+    for child in ("transcribe_asr/run.py", "transcribe_sheetsage/run.py"):
+        source = (root / child).read_text(encoding="utf-8")
+        failure_block = source[source.index('"status": "failed"') :]
+        assert "environment" in failure_block, f"{child} omits its environment on failure"
