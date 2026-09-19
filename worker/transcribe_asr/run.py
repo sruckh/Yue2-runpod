@@ -85,15 +85,22 @@ def run(request: dict, workdir: Path) -> dict:
 def _environment() -> dict:
     """The stack this child actually ran on, for the parent to record.
 
-    **Why the child reports this rather than the parent inferring it.** `cover`
-    can run this stage under two different interpreters — its own venv, or the
-    main environment, selected by `YUE2_ASR_IN_MAIN` — and the job response looks
-    identical either way. A successful cover therefore cannot say which stack
-    produced the lyrics, which makes the unification experiment unanswerable from
-    its own result. Reporting it here means the answer travels with the output.
+    **Why the child reports this rather than the parent inferring it.** This stage
+    *used* to run either in its own venv or in the main environment, selected by a
+    `YUE2_ASR_IN_MAIN` variable, and the job response looked identical either way
+    — so a successful cover could not say which stack produced the lyrics, which
+    made the unification experiment unanswerable from its own result. Reporting it
+    here is what made the answer travel with the output, and it is how the
+    experiment was settled.
 
-    `torch` is included because the two environments differ in exactly that: the
-    venv resolved 2.14.0, the main environment pins 2.10.0. A transcription that
+    The two-environment setup is gone: there is one environment now, and the
+    variable with it. This reporting stays useful regardless — it is how a job
+    says which stack ran, and it would make a future environment change visible
+    rather than silent.
+
+    `torch` is included because that was the variable the experiment moved: the
+    venv had resolved 2.14.0 where the main environment pins 2.10.0. A
+    transcription that
     is subtly wrong because of the version gap would still return 200, so the
     version needs to be visible beside the text.
     """

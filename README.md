@@ -210,8 +210,8 @@ because validation and storage resolution both run before generation.
       ├─ validate ──────── against the pipeline's own bounds, before any GPU work
       ├─ resolve storage ─ a bad bucket fails here, not after a long generation
       │
-      ├─ [cover] SheetsSage2 → melody.abc    ┐ each runs in its own venv as a
-      ├─ [cover] Qwen3-ASR   → lyrics.txt    ┘ subprocess, then exits
+      ├─ [cover] SheetsSage2 → melody.abc    ┐ each runs as its own subprocess,
+      ├─ [cover] Qwen3-ASR   → lyrics.txt    ┘ then exits
       │
       ├─ generate
       │    ├─ plan   → score.abc      the model writes the music as notation first
@@ -240,11 +240,11 @@ worker/
 ├── config.py              environment-driven settings
 ├── modes.py               create | cover | edit dispatch
 ├── abc_score.py           ABC validation and chord stripping
-├── subprocess_runner.py   runs a model family in its own venv
+├── subprocess_runner.py   runs one model family as its own subprocess
 ├── vram.py                device-wide memory sampling, per job
 ├── check_env.py           asserts each environment matches its pins
-├── transcribe_sheetsage/  audio → melody.abc   (own venv)
-├── transcribe_asr/        audio → lyrics.txt   (own venv)
+├── transcribe_sheetsage/  audio → melody.abc   (subprocess entrypoint)
+├── transcribe_asr/        audio → lyrics.txt   (subprocess entrypoint)
 ├── requirements.txt       exact pins — never a loose range
 └── .runpod/               endpoint config and example job payloads
 tests/                     GPU and B2 both mocked — runs with no hardware
@@ -301,7 +301,7 @@ Optional environment variables: `VOLUME_ROOT`, `MEMORY_BUDGET_GIB`,
 | Endpoint setting | Value | Why |
 |---|---|---|
 | GPU | any 24 GB card, ×1 | measured peaks 8.3–9.1 GiB; one song at a time |
-| Container disk | 30 GB | the image alone is 10.8 GB (CUDA wheels + torch) |
+| Container disk | 30 GB | the image was 10.8 GB with two torch stacks; the venv collapse removes ~6.5 GB of that, so 20 GB is ample |
 | Job timeout | ≥ 30 min | generation plus model load, with headroom |
 | Network volume | `/runpod-volume` | datacenter-specific — endpoint and volume must share a DC |
 
@@ -322,10 +322,17 @@ worker that keeps costing money.
 **The pipeline boots before the first job**, not lazily. A lazy first load would
 put the weight download inside a job's own timeout.
 
-**Isolation is deliberate.** SheetSage2 pins torch 2.8.0 / numpy 1.24.3, which
-cannot coexist with YuE2's torch 2.10.0 / numpy 2.2.6, so each model family gets
-its own venv and runs as a subprocess — which also returns its VRAM to the driver
-on exit. That is why a cover costs no more VRAM than a create.
+**One environment, separate processes.** SheetSage2 and Qwen3-ASR were originally
+given their own virtual environments, on the assumption their pins could not
+coexist with YuE2's torch 2.10.0 / numpy 2.2.6. That assumption was tested and was
+wrong: both run correctly on the main stack — verified on hardware, including a
+SheetSage2 transcription of 168 notes with the chord symbols correctly absent. The
+venvs were removed, and the image is ~6.5 GB smaller for it.
+
+**What remains is the process boundary, and that is the part that matters.** Each
+model family still runs as its own subprocess, which returns its VRAM to the
+driver on exit — that is why a cover costs no more VRAM than a create, and it is
+independent of whether the interpreter is shared.
 
 **Importing `handler` has side effects** — it boots the model and starts the SDK.
 Anything inspecting the code uses `python -m py_compile`, never `import`.
