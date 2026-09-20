@@ -28,6 +28,27 @@ import pytest
 
 from schema import validate_job, validate_mode, validate_mode_inputs
 
+#: A real (if silent) WAV header — 44 bytes, no samples.
+#:
+#: Fixtures here used to write `b"RIFF"` as a stand-in for "some audio". That is a
+#: *truncated* file, and `audio_probe` now refuses it before a transcription model
+#: loads on it — correctly, since 4 bytes cannot be decoded. A fixture that is not
+#: real audio makes a test pass for the wrong reason.
+_MINIMAL_WAV = (
+    b"RIFF"
+    + (36).to_bytes(4, "little")
+    + b"WAVEfmt "
+    + (16).to_bytes(4, "little")
+    + (1).to_bytes(2, "little")
+    + (1).to_bytes(2, "little")
+    + (24000).to_bytes(4, "little")
+    + (48000).to_bytes(4, "little")
+    + (2).to_bytes(2, "little")
+    + (16).to_bytes(2, "little")
+    + b"data"
+    + (0).to_bytes(4, "little")
+)
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 WORKER_DIR = REPO_ROOT / "worker"
 if str(WORKER_DIR) not in sys.path:
@@ -139,8 +160,11 @@ def test_handler_fetches_a_url_into_a_local_path(
     handler_module: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The bug: the mode received a URL where it needed a path."""
+    # A real (if silent) WAV header. `b"RIFF"` alone is a truncated file, which
+    # `audio_probe` now refuses before a model loads on it — see
+    # tests/test_audio_probe.py. The fixture has to be actual audio.
     local = tmp_path / "downloaded.wav"
-    local.write_bytes(b"RIFF")
+    local.write_bytes(_MINIMAL_WAV)
 
     seen: dict[str, Any] = {}
 
@@ -163,11 +187,21 @@ def test_handler_fetches_a_url_into_a_local_path(
     assert seen["urls"] == ["https://example.invalid/source.wav"]
 
 
-def test_handler_passes_through_an_already_local_path(handler_module: Any) -> None:
+def test_handler_passes_through_an_already_local_path(handler_module: Any, tmp_path: Path) -> None:
+    """A local path is used as-is, with no fetch.
+
+    The file has to exist and be real audio: the probe reads it on both routes,
+    so a path to nothing is now a named failure rather than a silent pass-through
+    (which is the point — a wrong local path used to reach SheetSage2 and fail
+    there, 32 s later, with a decoder message).
+    """
     from schema import validate_job as vj
 
-    params = vj(cover_job(source_audio="/tmp/already-here.wav"))
-    assert handler_module._fetch_source_audio(params, "job-1") == "/tmp/already-here.wav"
+    local = tmp_path / "already-here.wav"
+    local.write_bytes(_MINIMAL_WAV)
+
+    params = vj(cover_job(source_audio=str(local)))
+    assert handler_module._fetch_source_audio(params, "job-1") == str(local)
 
 
 def test_handler_raises_a_named_error_when_the_fetch_fails(
@@ -212,7 +246,7 @@ def test_cover_reaches_the_mode_with_a_local_path(
     from schema import validate_job as vj
 
     source = tmp_path / "source.wav"
-    source.write_bytes(b"RIFF")
+    source.write_bytes(_MINIMAL_WAV)
     params = vj(cover_job(source_audio=str(source)))
 
     reached: dict[str, Any] = {}
@@ -361,3 +395,140 @@ def test_the_language_comes_from_the_child_not_the_request() -> None:
     assert "params." not in record.split('"language"')[1].split("\n")[0], (
         "the language is read from the request, not the transcription"
     )
+
+
+# =============================================================================
+# The fetch identifies what arrived, before a model loads on it
+# =============================================================================
+#
+# Written against a real job failure. A cover job's `source_audio` URL served
+# something that was not audio, and the job died ~32 s in — after SheetSage2 had
+# loaded — with ffmpeg's message, which is byte-for-byte identical for an empty
+# file, an HTML page, a JSON body and a plain-text denial. The operator learned
+# nothing, and paid a model load to learn it.
+#
+# These tests pin the two things that make the message useful: it names *what*
+# arrived, and the remedy matches the kind.
+
+
+@pytest.mark.parametrize(
+    ("label", "body", "expected"),
+    [
+        ("html", b"<!DOCTYPE html><html><body>404 Not Found</body></html>", "HTML page"),
+        ("json", b'{"error":"not found","status":404}', "JSON body"),
+        ("plain", b"Access Denied", "plain text"),
+        ("empty", b"", "no data"),
+    ],
+)
+def test_a_non_audio_download_is_named_before_the_mode_runs(
+    handler_module: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, label: str, body: bytes, expected: str
+) -> None:
+    """The failure names what arrived, and says to check the URL."""
+    served = tmp_path / "downloaded"  # no extension, as the SDK writes it
+    served.write_bytes(body)
+
+    fake_utils = type(sys)("runpod.serverless.utils")
+    fake_utils.download_files_from_urls = lambda job_id, urls: [str(served)]  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "runpod.serverless.utils", fake_utils)
+
+    params = validate_job(cover_job())
+
+    with pytest.raises(handler_module.WorkerError) as caught:
+        handler_module._fetch_source_audio(params, "job-1")
+
+    message = str(caught.value)
+    assert expected in message, f"{label}: message does not name the kind — {message}"
+    assert "Check that the URL serves the recording itself" in message
+    # The failing production message blamed nothing in particular; this one must
+    # also pre-empt the wrong conclusion, since the file genuinely has no suffix.
+    assert "no extension by design" in message
+
+
+def test_a_truncated_download_says_retry_not_check_the_url(
+    handler_module: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cut-off download and a wrong URL have different fixes.
+
+    Telling someone to check their URL when the bytes were truncated sends them
+    to the one place the problem is not.
+    """
+    served = tmp_path / "downloaded"
+    served.write_bytes(b"RIFF")  # a WAV that never finished arriving
+
+    fake_utils = type(sys)("runpod.serverless.utils")
+    fake_utils.download_files_from_urls = lambda job_id, urls: [str(served)]  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "runpod.serverless.utils", fake_utils)
+
+    params = validate_job(cover_job())
+
+    with pytest.raises(handler_module.WorkerError) as caught:
+        handler_module._fetch_source_audio(params, "job-1")
+
+    message = str(caught.value)
+    assert "cut off" in message
+    assert "Retry the job" in message
+    assert "Check that the URL serves" not in message
+
+
+def test_a_url_that_yields_nothing_is_named_not_silently_returned(
+    handler_module: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`download_files_from_urls` can return an empty list without raising.
+
+    That used to be reported as "downloaded to nothing", which is accurate but
+    does not say what to do. The message now points at the SDK's silence.
+    """
+    fake_utils = type(sys)("runpod.serverless.utils")
+    fake_utils.download_files_from_urls = lambda job_id, urls: []  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "runpod.serverless.utils", fake_utils)
+
+    params = validate_job(cover_job())
+
+    with pytest.raises(handler_module.WorkerError) as caught:
+        handler_module._fetch_source_audio(params, "job-1")
+
+    assert "downloaded to nothing" in str(caught.value)
+    assert "serves the file directly" in str(caught.value)
+
+
+def test_a_data_uri_is_routed_to_the_sdk_not_treated_as_a_path(
+    handler_module: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A base64 payload is long but is not a path.
+
+    The route test used to be `len(source) > 512`, so a base64 URI shorter than
+    that fell through to the local-path branch and was stat()'d as a filename.
+    """
+    served = tmp_path / "decoded"
+    served.write_bytes(_MINIMAL_WAV)
+
+    called: dict[str, Any] = {}
+
+    def fake_download(job_id: str, urls: list[str]) -> list[str]:
+        called["urls"] = urls
+        return [str(served)]
+
+    fake_utils = type(sys)("runpod.serverless.utils")
+    fake_utils.download_files_from_urls = fake_download  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "runpod.serverless.utils", fake_utils)
+
+    params = validate_job(cover_job(source_audio="data:audio/wav;base64,UklGRg=="))
+    resolved = handler_module._fetch_source_audio(params, "job-1")
+
+    assert resolved == str(served)
+    assert called["urls"] == ["data:audio/wav;base64,UklGRg=="], "a data: URI must go to the SDK"
+
+
+def test_real_audio_still_passes_through_the_handler(
+    handler_module: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The guard must not break the case it exists to protect."""
+    served = tmp_path / "b3f1c2d4-0000-4000-8000-000000000000"  # bare UUID, no ext
+    served.write_bytes(_MINIMAL_WAV)
+
+    fake_utils = type(sys)("runpod.serverless.utils")
+    fake_utils.download_files_from_urls = lambda job_id, urls: [str(served)]  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "runpod.serverless.utils", fake_utils)
+
+    params = validate_job(cover_job())
+    assert handler_module._fetch_source_audio(params, "job-1") == str(served)

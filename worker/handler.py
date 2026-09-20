@@ -45,6 +45,7 @@ from config import CacheConfig, ConfigError, WorkerConfig
 _CONFIG_CACHE = CacheConfig()
 _CONFIG_CACHE.apply_hf_env()
 
+import audio_probe  # noqa: E402
 import runpod  # noqa: E402 - must follow apply_hf_env()
 from vram import DEFAULT_INTERVAL_SECONDS, VramSampler  # noqa: E402
 
@@ -318,6 +319,13 @@ def _fetch_source_audio(params: SongParameters, job_id: str) -> str:
     than a hand-rolled fetch — it is what the reference workers use, and it
     handles the base64 case, the job's scratch directory and cleanup.
 
+    **The result is identified before it is returned.** A URL that serves an HTML
+    error page, a JSON envelope or nothing at all decodes as far as SheetSage2 is
+    concerned — ffmpeg rejects it ~32 s later, after the transcription model has
+    loaded, with `Cannot decode audio: Invalid data found when processing input`,
+    which is the same message for every kind of wrong input. `audio_probe` reads
+    the first few KB and says what actually arrived, while it is still cheap.
+
     Returns the local path. Raises `WorkerError` with a message the caller can
     act on, because "the URL was wrong" is a caller problem, not a worker fault.
     """
@@ -325,7 +333,7 @@ def _fetch_source_audio(params: SongParameters, job_id: str) -> str:
     if not source:
         raise WorkerError("cover mode: no source_audio on the validated request")
 
-    if source.startswith("http://") or source.startswith("https://") or len(source) > 512:
+    if source.startswith("http://") or source.startswith("https://") or source.startswith("data:"):
         try:
             from runpod.serverless.utils import download_files_from_urls
         except ImportError as exc:  # pragma: no cover - the image always has runpod
@@ -335,12 +343,38 @@ def _fetch_source_audio(params: SongParameters, job_id: str) -> str:
             downloaded = download_files_from_urls(job_id, [source])
         except Exception as exc:
             raise WorkerError(f"cover mode: could not fetch source_audio — {exc}") from exc
-        if not downloaded:
-            raise WorkerError(f"cover mode: source_audio downloaded to nothing — {source[:120]}")
-        return str(downloaded[0])
+        if not downloaded or not downloaded[0]:
+            raise WorkerError(
+                f"cover mode: source_audio downloaded to nothing — {source[:120]}. "
+                "The SDK reports no error for some failures, so check the URL serves the file directly."
+            )
+        path = str(downloaded[0])
+    else:
+        # Already a path on disk.
+        path = source
 
-    # Already a path on disk.
-    return source
+    # Same check on both routes. A base64 `data:` URI is decoded by the SDK into
+    # a temporary path this code never sees, and a locally-supplied path can be
+    # wrong too — whether the bytes are audio is the question either way.
+    found = audio_probe.probe(Path(path))
+    if found.is_known_non_audio:
+        # The remedy differs by kind, so the message names it. A cut-off download
+        # is retried; a page or an error body means the URL is wrong. Telling
+        # someone to "check the URL" for a truncated upload sends them to the one
+        # place the problem is not.
+        if found.kind == "truncated":
+            remedy = "Retry the job, and check the file is complete at its source."
+        else:
+            remedy = (
+                "Check that the URL serves the recording itself and not a page, a redirect or an API response for it."
+            )
+        raise WorkerError(
+            f"cover mode: source_audio is not a decodable audio file — it is {found.describe()}. "
+            f"{remedy} (The downloaded file has no extension by design; that is not the problem.)"
+        )
+
+    log.info("cover mode: source audio %s (%s)", found.kind, found.describe())
+    return path
 
 
 def run_create_job(
