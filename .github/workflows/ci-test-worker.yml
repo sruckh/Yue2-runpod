@@ -30,11 +30,27 @@ jobs:
           python-version: "3.12"
 
       - name: Install test dependencies
-        # Only the test/lint tooling. The suite mocks torch and boto3 by design,
-        # so installing 2.5 GB of CUDA wheels to run it would be waste.
+        # Only the test/lint tooling, plus boto3 — no torch. Installing 2.5 GB of
+        # CUDA wheels to run a suite that mocks the GPU would be waste.
+        #
+        # **`boto3` is deliberately here, and this step is why CI was red for its
+        # first 49 runs.** The earlier comment claimed "the suite mocks torch and
+        # boto3 by design". Torch, yes. boto3, no: the fixtures inject a fake S3
+        # *client* into `B2Storage(client=...)`, but `upload_file` still runs for
+        # real and calls `boto3.s3.transfer.TransferConfig`. With boto3 absent
+        # that raised `ModuleNotFoundError`, which `upload_file`'s own
+        # `except Exception` converted into "Upload of audio.flac failed" — a
+        # message that reads like a B2 problem and sent three storage tests red.
+        #
+        # The pin is read from `worker/requirements.txt` rather than restated, so
+        # CI tests the same boto3 the image ships and the two cannot drift.
         run: |
           python -m pip install --upgrade pip
           pip install pytest ruff
+          BOTO3_PIN="$(grep -E '^boto3==' worker/requirements.txt)"
+          test -n "$BOTO3_PIN" || { echo "::error::no boto3 pin in worker/requirements.txt"; exit 1; }
+          echo "installing $BOTO3_PIN (the pin the image ships)"
+          pip install "$BOTO3_PIN"
 
       - name: Lint
         run: ruff check worker tests
@@ -43,8 +59,9 @@ jobs:
         run: ruff format --check worker tests
 
       - name: Type check
-        # Non-blocking: the worker imports torch, yue2 and boto3, none of which
-        # are installed here, so pyright reports unresolved imports by design.
+        # Non-blocking: the worker imports torch and yue2, neither of which is
+        # installed here, so pyright reports unresolved imports by design.
+        # boto3 *is* installed (above), so its call sites are checked for real.
         continue-on-error: true
         run: |
           pip install pyright

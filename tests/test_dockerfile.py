@@ -397,3 +397,107 @@ def test_every_torch_the_image_has_ever_pinned_is_still_written_down() -> None:
 # loosen anything.
 
 REQUIREMENTS = REPO_ROOT / "worker" / "requirements.txt"
+
+
+# =============================================================================
+# CI installs what the suite actually exercises
+# =============================================================================
+#
+# CI was red for its first 49 runs, and the reason is recorded in the workflow's
+# own comment: it claimed "the suite mocks torch and boto3 by design".
+#
+# Torch, yes. boto3, no. The fixtures inject a fake S3 *client* into
+# `B2Storage(client=...)`, but `upload_file` still runs for real and calls
+# `boto3.s3.transfer.TransferConfig`. With boto3 absent — as it was on every CI
+# run — that raised `ModuleNotFoundError`, which `upload_file`'s own
+# `except Exception` converted into:
+#
+#     storage.StorageError: Upload of audio.flac failed: No module named 'boto3'
+#
+# A message that reads like a B2 problem, on three storage tests, forever. The
+# tests passed locally only because this box happens to have boto3 1.34.46 from
+# the distro — so the suite was never exercising the path CI took.
+#
+# The rule below is the same one `test_dockerfile` applies to the image: the
+# workflow must install the dependency the code actually calls, at the version
+# the image ships rather than one restated by hand.
+#
+# It also caught a second-order trap worth naming: the obvious fix — hoisting
+# `from boto3.s3.transfer import TransferConfig` to module scope so it fails
+# loudly — is *wrong* here. In CI that makes `import storage` itself fail, so the
+# whole test module errors at collection instead of three tests failing.
+
+WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci-test-worker.yml"
+
+
+def ci_workflow() -> str:
+    assert WORKFLOW.is_file(), f"no CI workflow at {WORKFLOW}"
+    return WORKFLOW.read_text(encoding="utf-8")
+
+
+def test_ci_installs_boto3_at_the_pinned_version() -> None:
+    """boto3 is exercised for real by the suite, so CI must install it.
+
+    Not restated: the pin is read from `requirements.txt`, the same file the
+    image installs, so the two cannot drift.
+    """
+    workflow = ci_workflow()
+    pins = dict(check_env.parse_requirements(REQUIREMENTS))
+    assert "boto3" in pins, (
+        "worker/requirements.txt no longer pins boto3; storage.py imports it, so either the pin or the import is wrong"
+    )
+
+    # The install is by variable — `pip install "$BOTO3_PIN"` — so accept either
+    # spelling, but only on a **pip install line**. An earlier version of this
+    # check looked for the token anywhere in the file, which let a mutation that
+    # deleted the install pass: `BOTO3_PIN` survives in the `echo` and the
+    # `test -n` guard above it. A check that cannot fail is the defect this whole
+    # module exists to catch, so it is pinned to the line that does the work.
+    installs = [
+        line.strip() for line in workflow.splitlines() if "pip install" in line and not line.strip().startswith("#")
+    ]
+    assert installs, "no `pip install` line in the CI workflow at all"
+    assert any("boto3" in line.lower() or "BOTO3_PIN" in line for line in installs), (
+        "no CI `pip install` line installs boto3, but tests/test_storage.py drives "
+        "`upload_file` for real and it calls boto3.s3.transfer.TransferConfig. "
+        "Without it those tests fail with a message that blames B2.\n"
+        f"pip install lines seen: {installs!r}"
+    )
+
+    # The pin must be *read* from the requirements file, not restated. Checking
+    # for the filename anywhere in the workflow is not enough — a comment naming
+    # it satisfies that, and a mutation hardcoding `boto3==1.43.97` passed. So
+    # this pins the assignment line itself.
+    assignments = [line for line in workflow.splitlines() if "BOTO3_PIN=" in line]
+    assert assignments, "no BOTO3_PIN assignment in the CI workflow"
+    assert all("worker/requirements.txt" in line for line in assignments), (
+        "the CI boto3 pin is not read from worker/requirements.txt, so CI can test "
+        "a different boto3 than the image installs — the drift the pin exists to "
+        f"prevent. Assignment line(s): {assignments!r}"
+    )
+
+    # ...and the install must *use* what was read. Without this, a bare
+    # `pip install boto3` alongside an unused `BOTO3_PIN` passes both checks
+    # while CI quietly installs an unpinned boto3 — found by mutating this test,
+    # which is the only reason it is here.
+    variable = assignments[0].split("=", 1)[0].strip()
+    assert any(variable in line for line in installs), (
+        f"the pin is read into ${variable} but no `pip install` line installs it, "
+        f"so the read is decorative. pip install lines: {installs!r}"
+    )
+
+
+def test_ci_does_not_claim_boto3_is_mocked() -> None:
+    """The comment that caused the 49 red runs must not come back.
+
+    A workflow whose prose describes a design the workflow does not implement is
+    worse than no comment: it is the reason nobody looked.
+    """
+    workflow = ci_workflow()
+    for line in workflow.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#") and "mock" in stripped and "boto3" in stripped:
+            raise AssertionError(
+                f"CI comments claim boto3 is mocked, but the suite calls it for "
+                f"real — this is the claim that hid the failure: {stripped!r}"
+            )

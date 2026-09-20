@@ -98,14 +98,18 @@ generation is real.
 | Cached models | `m-a-p/YuE2-3B` | RunPod's cached-models feature holds **one** repo. The worker caches all five into the volume and downloads the rest on first boot |
 
 **The GPU list may name several 24 GB types; the worker runs on whichever the pool
-provides.** The pool is not homogeneous — the same endpoint has reported device
-totals of 23034 MiB and 24564 MiB from cards sold as the same tier, and host RAM
-has varied between 126 GB and 507 GB across workers. Quote the card alongside any
-peak you record.
+provides.** The pool is not homogeneous, and `device_total_mib` is how a job says
+which card it actually got: **23034 MiB on an NVIDIA L4**, **24564 MiB on an
+NVIDIA GeForce RTX 4090**. Host RAM has varied between 126 GB and 507 GB across
+workers. Quote the card alongside any peak you record.
 
-**Peak VRAM scales with song length.** A 57 s song measured 8.5 GiB; a 197 s song
-measured 9.1 GiB; the published 14.08 GiB figure was a ~3.6-minute song at full
-context. Compare like with like.
+**Peak VRAM scales with song length.** A 57 s song measured 8.5 GiB; 197 s
+measured 9.1 GiB; 282 s measured 9.4 GiB. The published 14.08 GiB figure was a
+~3.6-minute song at "full context" on a 4090 — and our 282 s run, which is
+*longer*, on the same card, peaked ~4.4 GiB below it. So length is not the whole
+story; the difference is most likely context length rather than song duration, and
+**14.08 GiB should be treated as a ceiling for a configuration we have not
+reproduced**, not as refuted. Compare like with like.
 
 **No model weights are baked in** — verified from inside the built container by a
 build-time guard, not assumed.

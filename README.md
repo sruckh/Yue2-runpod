@@ -343,14 +343,15 @@ Optional environment variables: `VOLUME_ROOT`, `MEMORY_BUDGET_GIB`,
 
 | Endpoint setting | Value | Why |
 |---|---|---|
-| GPU | any 24 GB card, ×1 | measured peaks 8.3–9.1 GiB; one song at a time |
+| GPU | any 24 GB card, ×1 | measured peaks 8.3–9.4 GiB; one song at a time |
 | Container disk | 30 GB | the image was 10.8 GB with two extra torch stacks; 20 GB is ample either way |
 | Job timeout | ≥ 30 min | generation plus model load, with headroom |
 | Network volume | `/runpod-volume` | datacenter-specific — endpoint and volume must share a DC |
 
 The GPU list may name several 24 GB types; the worker runs on whichever the pool
-provides. **Quote the card with any peak you record** — the pool is not
-homogeneous and reported totals differ between cards.
+provides. **Quote the card with any peak you record.** `device_total_mib` in the
+response says which card a job got — 23034 MiB on an L4, 24564 MiB on a 4090 —
+and host RAM has ranged from 126 GB to 507 GB across workers.
 
 ## Design notes
 
@@ -386,14 +387,20 @@ Anything inspecting the code uses `python -m py_compile`, never `import`.
 
 All three modes are **verified end to end on real hardware**:
 
-| Mode | Result | Peak VRAM | Song |
-|---|---|---|---|
-| `create` | ✅ | 9072 MiB | 197 s |
-| `cover` | ✅ | 9270 MiB | 199 s |
-| `edit` | ✅ | 9348 MiB | 199 s |
+| Mode | Result | Peak VRAM | Song | Card |
+|---|---|---|---|---|
+| `create` | ✅ | 9072 MiB | 197 s | L4 |
+| `create` | ✅ | 9628 MiB | **282 s** | RTX 4090 |
+| `cover` | ✅ | 9270 MiB | 199 s | L4 |
+| `edit` | ✅ | 9348 MiB | 199 s | L4 |
 
 A cover runs two extra model families and peaks **no higher than a create of the
-same song** — the subprocess boundary holds, with ~13 GB left on a 24 GB card.
+same song** — the subprocess boundary holds, with ~14 GB left on a 24 GB card.
+
+The 282 s run is the longest song this worker has produced, and it moves the peak
+by only ~550 MiB over the 197 s one — growth is real but sub-linear in this range.
+Full budget, including why the published 14.08 GiB figure is not directly
+comparable, in [`shared/vram-budget.md`](shared/vram-budget.md).
 
 Not yet verified, and worth knowing before you rely on them:
 
