@@ -78,11 +78,16 @@ not belong in a job response, and polling stays cheap.
 
 There are **no `key`, `meter` or `tempo` request fields**, and no response fields
 either — YuE2's own request schema has exactly seven inputs (`style`, `lyrics`,
-`cot`, `seed`, `abc`, `cfg_scale`, `id`) and the official demo does not accept
-them as input. The demo's "Key Cm · Meter 4/4 · Tempo 145 BPM" row is *parsed from
-the score it just generated*.
+`cot`, `seed`, `abc`, `cfg_scale`, `id`).
 
-So a UI should read them off `score_abc_url`, which is where they live:
+It is easy to think otherwise, because the authors' demo page shows a row reading
+*"Language Chinese · Key D#m · Meter 4/4 · Tempo 93 BPM"*. That row is **output**:
+on the page it sits directly under "Original score recording / Play audio", beside
+the `Score` / `Raw ABC` / `Lyrics` / `Style prompt` tabs — a summary of the song
+just generated, read off the score. The one `Language` control on that page is a
+*filter* in the Genre Explorer browser, not a generation input.
+
+So a UI should read all four off `score_abc_url`, which is where they live:
 
     M:4/4          meter
     Q:1/4=145      tempo, in quarter-notes per minute
@@ -90,6 +95,15 @@ So a UI should read them off `score_abc_url`, which is where they live:
 
 That is a client-side parse of the ABC — a few lines of regex — not an API call.
 They are properties of what the model wrote, not knobs on the request.
+
+**Putting them in `style` does not make them inputs.** Measured over six GPU jobs
+with matched seeds: asking for "G minor, 3/4, tempo 90 BPM" in the style text
+returned `K:G` (major), `M:4/4` — identical to the control — and the tempo spread
+was within seed variance (seeds 111 and 222 returned byte-identical tempos with and
+without the hint). The authors' own guidance says to put "intended tempo" in
+`style`, and *intended* is the operative word. Key and meter appear in their
+documentation only as things to **inspect and correct afterwards**, never as
+controls.
 
 **`language` is different, and is in the response** — under `stages.asr.language`
 for a cover, because it is *detected* from the recording rather than chosen.

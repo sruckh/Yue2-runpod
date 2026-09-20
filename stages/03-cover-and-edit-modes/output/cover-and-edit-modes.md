@@ -39,10 +39,10 @@
 | `worker/transcribe_sheetsage/run.py` | Melody transcription, subprocess entrypoint |
 | `worker/transcribe_asr/run.py` | Lyric transcription, subprocess entrypoint |
 
-_(Row text updated 2026-09-19: they read "in its own venv" / "executed in the
-… venv" as written. The venvs were removed the next day — see the addendum at the
-top. The process boundary these rows describe is unchanged.)_
-| `Dockerfile` | Builds both venvs into the image |
+_(Row text updated 2026-09-19: the first four rows read "in its own venv" /
+"executed in the … venv" as written. The venvs were removed the next day — see the
+addendum at the top. The process boundary these rows describe is unchanged.)_
+| `Dockerfile` | Built both venvs into the image; now one environment (2026-09-19) |
 | `tests/test_modes.py`, `tests/test_abc_score.py`, `tests/test_mode_wiring.py`, `tests/test_review_regressions_stage03.py` | 93 new tests |
 
 ## The bar, and what it found

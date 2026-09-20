@@ -244,7 +244,8 @@ def test_a_c_compiler_is_installed(dockerfile: str) -> None:
 
     A comment in this Dockerfile once argued the slim base was sufficient
     *because* nothing in YuE2 needs triton. That argument was about one of the
-    three environments.
+    three environments that existed at the time, and it was generalised to the
+    whole image. There is one environment now, and it needs the compiler.
     """
     installs = [
         line for line in dockerfile.splitlines() if "apt-get install" in line and not line.strip().startswith("#")
@@ -333,26 +334,35 @@ def test_env_variables_are_asserted_not_assumed(dockerfile: str) -> None:
 ASR_REQUIREMENTS = REPO_ROOT / "worker" / "transcribe_asr" / "requirements.txt"
 
 
-def test_the_asr_environment_declares_its_torch() -> None:
-    """The one unpinned torch must be pinned, to the version proven on hardware."""
+def test_the_asr_torch_pin_is_recorded() -> None:
+    """The version that transcribed a real cover stays written down.
+
+    Qwen3-ASR has no environment of its own any more — it runs on the main torch
+    pin, and `--no-deps` is what keeps `accelerate`'s `torch>=2.0.0` out of the
+    resolution. This file is the *record* of which version that tree once
+    resolved, and it is the only place the number 2.14.0 survives. A future
+    reader who sees only `--no-deps` cannot tell whether the tree was ever
+    exercised; this is the evidence that it was, on hardware.
+    """
     assert ASR_REQUIREMENTS.is_file(), (
-        "no requirements file for the Qwen3-ASR environment, so its torch is "
-        "resolved by the dependency tree rather than chosen"
+        "the Qwen3-ASR record file is gone, taking with it the only account of "
+        "which torch that dependency tree resolved and how it was verified"
     )
     pins = dict(check_env.parse_requirements(ASR_REQUIREMENTS))
-    assert "torch" in pins, "the Qwen3-ASR environment does not pin torch"
+    assert "torch" in pins, "the Qwen3-ASR record does not name a torch"
     assert pins["torch"] == "2.14.0", (
-        f"the ASR torch pin is {pins['torch']!r}. 2.14.0 is the version that "
+        f"the recorded ASR torch is {pins['torch']!r}. 2.14.0 is the version that "
         "transcribed a real cover; change it only with a hardware test behind it."
     )
 
 
-def test_every_torch_in_the_image_is_pinned_to_something() -> None:
-    """All three environments, checked together so a fourth cannot slip in bare.
+def test_every_torch_the_image_has_ever_pinned_is_still_written_down() -> None:
+    """All three pin sets, checked together so a fourth cannot slip in bare.
 
-    A venv built from a bare `pip install <pkg>` inherits whatever the tree
-    happens to resolve. That is a reproducibility hole regardless of whether the
-    resolved version works.
+    Two of these are records rather than installs — see each file's header. They
+    stay checked because a record that silently loses its torch line stops being
+    a record, and the difference between "we chose 2.8.0" and "we never said" is
+    exactly what the unification experiment had to establish.
     """
     files = {
         "main": REPO_ROOT / "worker" / "requirements.txt",

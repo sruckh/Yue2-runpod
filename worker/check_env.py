@@ -47,20 +47,25 @@ from importlib import metadata
 from pathlib import Path
 
 #: Where the pins live, relative to this file. One fact, one file.
+#:
+#: There is only one such file. `transcribe_sheetsage/requirements.txt` and
+#: `transcribe_asr/requirements.txt` still exist as *records* of what each model
+#: family used to pin, but no environment installs them and no check asserts
+#: them — both families run on the pins below. A constant pointing at them was
+#: removed rather than left defined-and-unused, because an unused constant
+#: reading `SHEETSAGE_REQUIREMENTS` implies a check that does not exist.
 YUEE2_REQUIREMENTS = Path(__file__).parent / "requirements.txt"
-SHEETSAGE_REQUIREMENTS = Path(__file__).parent / "transcribe_sheetsage" / "requirements.txt"
 
-#: Packages that are *expected* to be absent from some environments, so their
-#: absence is reported but does not fail a check. `qwen-asr` belongs only to the
-#: Qwen3-ASR environment; a check run against the main or SheetSage2 pins would
-#: otherwise fail on a package those environments were never meant to have.
+#: Packages that are *expected* to be absent, so their absence is reported but
+#: does not fail a check. `qwen-asr` is installed with `--no-deps`, so its
+#: declared dependency tree is deliberately not present; a check that failed on
+#: those would be failing on the design.
 #:
 #: This entry used to carry a second justification — that `qwen-asr` "pins no
-#: torch at all, so which torch it resolved cannot be asserted". That is no
-#: longer true: torch is pinned for that environment in
-#: `worker/transcribe_asr/requirements.txt`, and the build asserts it. The
-#: advisory flag is about absence, not about torch, and the note is corrected
-#: rather than left to mislead.
+#: torch at all, so which torch it resolved cannot be asserted". That stopped
+#: being true when torch was pinned for its own environment, and is now doubly
+#: moot: there is no such environment, and qwen-asr runs on the torch pinned
+#: below. The advisory flag is about absence, not about torch.
 REPORT_ONLY = frozenset({"qwen-asr"})
 
 #: Packages whose import is worth attempting. Deliberately excludes anything

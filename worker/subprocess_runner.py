@@ -1,35 +1,43 @@
-"""Run a model family in its own virtual environment, as a subprocess.
+"""Run a model family as its own subprocess, under a named interpreter.
 
-The cover path needs two model families whose dependencies cannot coexist with
-YuE2's, or with each other:
+Cover needs three model families in sequence. **They share one environment** —
+the boundary below is a *process* boundary, and that is the point:
+
+**Guaranteed VRAM release.** When the subprocess exits, the driver reclaims its
+memory, with no reliance on in-process `del model; torch.cuda.empty_cache()`
+being correct for a `trust_remote_code` model class we do not control. That is
+what keeps a cover job's peak at YuE2's own ceiling instead of the sum of three
+models — measured, not assumed: see `shared/vram-budget.md`.
+
+The environments were originally separate, on the assumption the pins could not
+coexist:
 
 | Environment | torch | transformers | numpy |
 |---|---|---|---|
-| YuE2 (this process) | 2.10.0 | 4.57.6 | 2.2.6 |
+| YuE2 | 2.10.0 | 4.57.6 | 2.2.6 |
 | SheetSage2 | 2.8.0 | 4.45.2 | 1.24.3 |
-| Qwen3-ASR | unpinned | 4.57.6 | — |
+| Qwen3-ASR | unpinned (resolved 2.14.0) | 4.57.6 | — |
 
-A subprocess boundary buys two things, and the *second* is the one that matters
-here. The first is dependency isolation — YuE2's torch 2.10 never has to coexist
-with SheetSage2's 2.8 in one interpreter. The second is **guaranteed VRAM
-release**: when the subprocess exits, the driver reclaims its memory, with no
-reliance on in-process `del model; torch.cuda.empty_cache()` being correct for a
-`trust_remote_code` model class we do not control.
+That assumption was never tested. The unification experiment tested it — both
+families load and produce correct output on YuE2's stack — and both venvs were
+removed on 2026-09-19, taking ~6.5 GB of duplicated torch with them. Dependency
+isolation was the *first* reason for this boundary and it turned out not to be
+needed; VRAM release was the second and it is the one carrying the design.
 
-That is what keeps a cover job's peak VRAM at YuE2's own ceiling instead of the
-sum of three models — see `shared/vram-budget.md`.
+`venv_name` survives so a future family whose pins genuinely conflict can be
+given its own interpreter by naming it, without redesigning this module.
 
 Protocol
 --------
 Files, not pipes or shared memory. The parent writes `request.json` into a fresh
-work directory, runs `<venv>/bin/python <entrypoint> --request <path>`, and reads
+work directory, runs `<interpreter> <entrypoint> --request <path>`, and reads
 back `result.json` plus whatever artifacts the stage wrote. Everything the child
 produces is inspectable after the fact, which matters when the only other
 diagnostic channel is a container log.
 
-The virtual environments are built into the **image**, never on a dev box — see
-the root `Dockerfile`. Nothing in this module creates an environment; if the
-interpreter is missing, that is an image-build failure and it says so.
+Any environment this names is built into the **image**, never on a dev box — see
+the root `Dockerfile`. Nothing in this module creates one; if the interpreter is
+missing, that is an image-build failure and it says so.
 """
 
 from __future__ import annotations

@@ -94,15 +94,14 @@ def _environment() -> dict:
     experiment was settled.
 
     The two-environment setup is gone: there is one environment now, and the
-    variable with it. This reporting stays useful regardless — it is how a job
-    says which stack ran, and it would make a future environment change visible
-    rather than silent.
+    variable with it. This reporting stays because the property it guards did not
+    go away with the venv — a transcription that is subtly wrong because of a
+    version gap still returns 200, so the versions belong beside the text. It is
+    also how a future environment change would be visible rather than silent.
 
-    `torch` is included because that was the variable the experiment moved: the
-    venv had resolved 2.14.0 where the main environment pins 2.10.0. A
-    transcription that
-    is subtly wrong because of the version gap would still return 200, so the
-    version needs to be visible beside the text.
+    `torch` is included because that is the version that actually moved: the venv
+    had resolved 2.14.0 where the main environment pins 2.10.0, and both produced
+    a working transcription.
     """
     import platform
     import sys

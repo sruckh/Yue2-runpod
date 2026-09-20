@@ -262,10 +262,12 @@ def prepare_cover(params: SongParameters, workdir: Path) -> ModeResult:
         # language field; ours reports what the model found rather than what a
         # caller set, which is the only version that can be honest for a cover.
         "language": (asr.payload or {}).get("language"),
-        # Which stack produced this transcription. `cover` can run the ASR stage
-        # under its own venv or the main environment, and the response is
-        # otherwise identical — so without this the unification experiment cannot
-        # be read from its own result. The child reports it; we pass it through.
+        # Which stack produced this transcription. The child reports it; we pass
+        # it through. This is what made the unification experiment answerable
+        # from its own result, and it now records the answer: both families run
+        # on the main stack. Kept because a version gap can make a transcription
+        # subtly wrong while still returning success, so the versions belong in
+        # the response next to the text.
         "environment": (asr.payload or {}).get("environment"),
     }
 

@@ -1,24 +1,41 @@
-# Qwen3-ASR environment — cover mode's lyric transcription.
+# Qwen3-ASR's torch pin — a **record of a resolved conflict, not an install.**
 #
-# This file exists for **one pin**, and the reason is not that the resolved
-# version is wrong. It is that the version was *unspecified*.
+# **Nothing installs this file.** Qwen3-ASR has no environment of its own: it runs
+# in the main one, on `torch==2.10.0+cu128` from `worker/requirements.txt` (and
+# `qwen-asr==0.0.6` itself installed there with `--no-deps`, so its own
+# `accelerate`/torch declarations never enter the resolution).
 #
-# `qwen-asr==0.0.6` pins `transformers==4.57.6` exactly, but declares torch only
-# through `accelerate==1.12.0`, which asks for `torch>=2.0.0` — no upper bound.
-# pip therefore takes whatever is newest at build time. The last build resolved
-# **torch 2.14.0**, pulled its CUDA 13.0 stack, and that environment then did real
-# work: a 197 s cover transcribed lyrics in 78.37 s and the job completed.
+# It is kept because it records *why* an environment was needed at all — the
+# problem this file solved is the problem `--no-deps` now solves, and a reader who
+# finds only the `--no-deps` line cannot tell whether it was a shortcut or a fix.
 #
-# So 2.14.0 is proven. What was not proven is that the *next* build would resolve
-# it: an image whose contents depend on the day it was built is not reproducible,
-# and nothing in the build would have reported the difference. Pinning freezes
-# what has been demonstrated on hardware.
+# The conflict it pinned around:
 #
-# Installed **before** qwen-asr, matching the sheetsage2 environment. That order
-# matters for the same reason it does there: with this pin already satisfied, pip
-# skips torch when it resolves qwen-asr's tree rather than re-picking it.
+#   `qwen-asr==0.0.6` pins `transformers==4.57.6` exactly, but declares torch only
+#   through `accelerate==1.12.0`, which asks for `torch>=2.0.0` — no upper bound.
+#   pip therefore took whatever was newest at build time. One build resolved
+#   **torch 2.14.0**, pulled its CUDA 13.0 stack, and that environment then did
+#   real work: a 197 s cover transcribed lyrics in 78.37 s and the job completed.
 #
-# No `--extra-index-url`: unlike torch 2.10.0, whose plain PyPI wheel is CPU-only,
-# the 2.14.0 wheel on PyPI is the CUDA build (554 MB) and brings `nvidia-*` cu13
-# packages with it. That is exactly what the last build installed.
+#   2.14.0 was therefore proven — and still not reproducible, because an image
+#   whose contents depend on the day it was built reports nothing when that
+#   changes. This pin froze what had been demonstrated.
+#
+# The resolution order mattered at the time: this file was applied **before**
+# `qwen-asr`, so pip found torch already satisfied and skipped re-picking it.
+#
+# Two facts from this episode are still load-bearing elsewhere:
+#
+#   * **`torch 2.14.0` from plain PyPI is a CUDA build.** Unlike 2.10.0, whose
+#     PyPI wheel is CPU-only, 2.14.0 ships the CUDA build (554 MB) and brings
+#     `nvidia-*` cu13 packages as ordinary dependencies. It carries no `+cuXXX`
+#     local version identifier, which is why `check_env.verify_cuda_build` reads
+#     `torch.version.cuda` rather than pattern-matching the version string — a
+#     check that looked for the identifier rejected this working build.
+#   * **A transcription that is subtly wrong because of a torch gap still returns
+#     200.** That is why both transcription children report their own `environment`
+#     (interpreter, python, torch, cuda) in `result.json`, and why the parent
+#     passes it through into the job response. It is how the unification
+#     experiment was answered from its own output.
+
 torch==2.14.0

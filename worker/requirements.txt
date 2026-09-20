@@ -56,11 +56,13 @@ mir_eval==0.8.2
 pretty_midi==0.2.10
 mido==1.3.3
 
-# --- Qwen3-ASR's runtime dependencies, for the unification experiment ---------
+# --- Qwen3-ASR's runtime dependencies -----------------------------------------
 #
-# `cover`'s lyric transcription normally runs in its own venv
-# (`/opt/venvs/qwen3-asr`). The unification question is whether it can run here
-# instead, which would delete a ~5 GB environment.
+# `cover`'s lyric transcription runs here, in this environment, alongside YuE2 and
+# SheetSage2. It was originally given its own venv (`/opt/venvs/qwen3-asr`) on the
+# assumption its pins could not coexist with these; the unification experiment
+# tested that assumption, it was wrong, and the venv was deleted. The pins below
+# are what the ASR family actually needs on this stack.
 #
 # **`qwen-asr` itself is deliberately NOT in this file.** This file is installed
 # with full dependency resolution, and `qwen-asr==0.0.6` pins

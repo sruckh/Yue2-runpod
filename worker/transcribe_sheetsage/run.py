@@ -55,16 +55,18 @@ MELODY_PROMPTS = ["timestamp", "downbeat_meter", "structure", "key", "melody_ful
 def _environment() -> dict:
     """The stack this child actually ran on, for the parent to record.
 
-    Mirrors the ASR child. `cover` can run this stage under its own venv or the
-    main environment, and the job response is otherwise identical — so without
-    this the unification experiment cannot be read from its own result. The child
-    is the authority: it knows which interpreter it is.
+    Mirrors the ASR child. This reporting was added to make the unification
+    experiment answerable from its own output — the stage could run under either
+    of two environments and the job response looked identical either way, so a
+    successful cover could not say which stack had produced the score. The two
+    environments are now one, and the answer that experiment produced is why:
+    this child runs on the main stack, at torch 2.10.0 / transformers 4.57.6.
 
-    `torch` and `transformers` are both here because both differ between the two
-    environments, and the jump is larger than the ASR one: 2.8.0 / 4.45.2 in the
-    venv against 2.10.0 / 4.57.6 in main. A transcription that is subtly wrong
-    because of that gap still returns success, so the versions need to be visible
-    beside the score.
+    It stays because the property it guards is permanent, not because the
+    experiment is unfinished. A model loaded with `trust_remote_code` and
+    transcribed with a version gap can be subtly wrong and still return success,
+    so the versions belong beside the score. It is also how a future environment
+    change would be visible rather than silent.
     """
     import platform
     import sys

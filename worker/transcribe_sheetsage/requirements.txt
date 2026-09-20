@@ -1,28 +1,42 @@
-# SheetSage2's dependency pins, vendored verbatim.
+# SheetSage2's upstream dependency pins — a **reference record, not an install.**
 #
 # Source: https://huggingface.co/m-a-p/SheetSage2/resolve/main/requirements.txt
 # Model:  m-a-p/SheetSage2 (CC BY-NC 4.0), built on m-a-p/MERT-v2-FullSong
 #
-# This file is copied into the repository rather than fetched during the image
-# build. Two reasons:
+# **Nothing installs this file.** SheetSage2 has no environment of its own: it
+# runs in the main one, on the pins in `worker/requirements.txt`
+# (torch 2.10.0+cu128, transformers 4.57.6, numpy 2.2.6) — verified on hardware,
+# not assumed. The package set below is still installed, because a handful of
+# these are SheetSage2-only and are not in `requirements.txt`; what is *not*
+# installed is any of these versions.
 #
-#   1. Reproducibility. Fetching a URL at build time means the image depends on
-#      whatever that URL serves today, so a rebuild can silently produce a
-#      different image. Vendoring pins it.
-#   2. It documents the constraint that drives the base image choice.
+# It is kept because it answers a question the code cannot: what did upstream
+# pin, and therefore what did the unification experiment actually move? The list
+# below is the "before"; `worker/requirements.txt` is the "after".
 #
-# **The numpy pin is why SheetSage2 needs Python 3.11, and it is not
-# negotiable by accident.** numpy 1.24.3 (April 2023) predates Python 3.12
-# (October 2023) and publishes wheels for cp38–cp311 only. On 3.12 pip finds no
-# wheel and tries to build numpy from source, which fails — 1.24 does not
-# support 3.12. So this environment is 3.11, and the base image is
-# `python:3.11-slim-trixie` rather than 3.12.
+# **numpy==1.24.3 is the pin that used to drive everything.** It predates Python
+# 3.12 and publishes cp38–cp311 wheels only, which is why the base image was
+# 3.11. SheetSage2 now runs on numpy 2.2.6, so that constraint no longer binds
+# and 3.11 is a conservative default rather than a requirement — see the
+# Dockerfile header.
 #
-# torch and torchaudio are installed from the CUDA 12.6 index *before* this
-# file is applied — see the Dockerfile. Installing them from PyPI here would
-# pull CPU-only builds. The pins below are then already satisfied and skipped.
-# (`==2.8.0` matches `2.8.0+cu126`: a local version identifier is ignored when
-# the requirement does not specify one.)
+# The other three pins worth reading: torch **2.8.0 → 2.10.0** and transformers
+# **4.45.2 → 4.57.6** were both jumps, and both produced a correct melody on the
+# first GPU run (job f5792fce, endpoint v27 — 168 note tokens across two named
+# voices, zero chord symbols, which is the melody-only contract). The
+# `mir_eval`/`pretty_midi`/`mido` trio was added to `requirements.txt` because
+# `midi_sheetsage2.py` imports them at module scope; `mido` is named explicitly
+# despite `pretty_midi` depending on it, because `pretty_midi` declares no
+# dependencies at all.
+#
+# `playwright` is deliberately absent from both lists: it needs a Chromium
+# download, and `rendering_sheetsage2.py` imports it inside a function. Rendering
+# is optional by the authors' design.
+#
+# Historical note: `torch==2.8.0` matches `2.8.0+cu126` under PEP 440 — a local
+# version identifier is ignored when the requirement does not specify one — which
+# is how this file was satisfied when it *was* installed against the CUDA 12.6
+# index.
 
 torch==2.8.0
 torchaudio==2.8.0

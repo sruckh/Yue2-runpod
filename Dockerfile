@@ -1,13 +1,14 @@
 # YuE2 RunPod Serverless worker — create, cover and edit modes.
 #
-# Base image: `python:3.11-slim-trixie`, deliberately.
+# Base image: `python:3.11-slim-trixie`.
 #
-#   3.11, not 3.12, because cover mode's SheetSage2 environment pins
-#   numpy==1.24.3, which predates Python 3.12 and publishes no cp312 wheels —
-#   see worker/transcribe_sheetsage/requirements.txt. Every pin YuE2 needs has
-#   cp311 wheels (torch 2.10.0 on both cu128 and cu126, triton 3.6.0,
-#   tiktoken 0.12.0, numpy 2.2.6), so one interpreter serves all three
-#   environments.
+#   3.11 is now a **conservative default, not a requirement.** It was originally
+#   forced: cover mode had its own SheetSage2 environment pinning numpy==1.24.3,
+#   which predates Python 3.12 and publishes no cp312 wheels. That environment is
+#   gone — both model families run in this one, on numpy 2.2.6 — so nothing in the
+#   image needs 3.11 any more. Moving to 3.12 would work on paper (every current
+#   pin has cp312 wheels) but has not been built or run on hardware, so the base
+#   stays where it is until someone does that deliberately.
 #
 #   `-trixie` is pinned explicitly because the bare `python:3.11-slim` tag is a
 #   moving target. It moved once already: `python:3.12-slim` resolved to Debian
@@ -138,7 +139,10 @@ RUN pip install --no-cache-dir --upgrade "huggingface-hub==0.36.2" \
     && pip install --no-cache-dir --no-deps "/tmp/wheel/${YUE2_WHEEL}" \
     && rm -rf /tmp/wheel
 
-# `qwen-asr` into the **main** environment, for the unification experiment.
+# `qwen-asr` into the **main** environment.
+#
+# It was originally installed here so the unification experiment could ask whether
+# it *could* run on the main stack. It now simply does — there is no other stack.
 #
 # `--no-deps` is load-bearing, not a shortcut. qwen-asr pins
 # `accelerate==1.12.0` and the YuE2 wheel pins `accelerate==1.13.0`; two exact
@@ -161,43 +165,40 @@ RUN pip install --no-cache-dir --no-deps "qwen-asr==0.0.6" \
     && python -c "import qwen_asr, importlib.metadata as m, sys; sys.exit(0 if m.version('qwen-asr') == '0.0.6' else 'expected 0.0.6')" \
     && python -c "import qwen_asr; print('qwen_asr importable in the main environment')"
 
-# --- isolated model-family environments (cover mode) --------------------------
+# --- the subprocess boundary (cover mode) -------------------------------------
 #
-# The cover path runs two more model families, and their dependencies cannot
-# coexist with YuE2's or with each other:
+# Cover runs two more model families beside YuE2's. **They share this one
+# environment** — the isolation that matters is the *process*, not the venv:
 #
-#   YuE2 (main, /app)  torch 2.10.0  transformers 4.57.6  numpy 2.2.6
-#   SheetSage2         torch 2.8.0   transformers 4.45.2  numpy 1.24.3
-#   Qwen3-ASR          torch (unpinned)  transformers 4.57.6  accelerate 1.12.0
+#   a subprocess exit returns its memory to the driver, which is what keeps a
+#   cover job's peak at YuE2's own ceiling rather than the sum of three models.
 #
-# So each gets its own venv, invoked as a subprocess. The second reason is VRAM:
-# a subprocess exit returns its memory to the driver, which is what keeps a
-# cover job's peak at YuE2's own ceiling rather than the sum of three models.
+# Both families were originally given virtual environments, on the assumption
+# their pins could not coexist:
 #
-# All three are Python 3.11 — the base interpreter — because that is what
-# SheetSage2's numpy pin requires. The isolation is about torch/numpy versions,
-# not about the interpreter.
+#   YuE2 (main)   torch 2.10.0  transformers 4.57.6  numpy 2.2.6
+#   SheetSage2    torch 2.8.0   transformers 4.45.2  numpy 1.24.3
+#   Qwen3-ASR     torch (unpinned, resolved 2.14.0)  accelerate 1.12.0
 #
-# Built here, in the image, and nowhere else — never on a dev box.
+# The unification experiment showed the assumption was never tested: both
+# families load and produce correct output on the main stack. BOTH VENVS WERE
+# REMOVED 2026-09-19, taking ~6.5 GB of duplicated torch with them. See "Why
+# there is one environment now" below.
+#
+# The `venv_name` parameter in `subprocess_runner` remains, so a future family
+# whose pins genuinely conflict can be given its own environment without a
+# redesign. Nothing uses it today.
+#
+# Anything built here is built in the image, on RunPod's platform — never on a
+# dev box. Requirements are vendored in the repository, not fetched from a URL at
+# build time: a fetched file makes the image depend on whatever is served that day.
 
-# Requirements are vendored in the repository, not fetched from a URL at build
-# time: a fetched file makes the image depend on whatever is served that day.
-# BOTH VENVS WERE REMOVED 2026-09-19 — see "Why there is one environment now".
-#
-# What used to be here: `python -m venv /opt/venvs/sheetsage2` installing torch
-# 2.8.0 from the cu126 index plus SheetSage2's pins, and `python -m venv
-# /opt/venvs/qwen3-asr` installing torch 2.14.0 plus qwen-asr. Together ~6.5 GB
-# of a duplicated torch stack, plus two `check_env` assertions and a summary line.
-#
-# Both are gone because the experiment that justified them came back negative for
-# the *need*: neither model family requires its own environment. See below.
-
-# --- verify all three environments -------------------------------------------------
+# --- verify the environment ---------------------------------------------------------
 #
 # These checks assert; they do not print. The previous versions here did
 # `print(torch.__version__)`, which reports the version without comparing it to
-# anything — so a venv that resolved the wrong torch printed the wrong number and
-# the build passed. The version pin is the entire reason that venv exists, so a
+# anything — so a wheel that resolved the wrong torch printed the wrong number and
+# the build passed. The version pin is the entire reason the check exists, so a
 # check that cannot fail on it is not a check.
 #
 # `check_env.py` reads the pins from the requirements files rather than restating
@@ -210,31 +211,36 @@ COPY worker/requirements.txt /tmp/main-requirements.txt
 COPY worker/check_env.py /tmp/check_env.py
 RUN python /tmp/check_env.py --requirements /tmp/main-requirements.txt
 
-# SheetSage2's environment, against its own vendored pins — this is where the
-# torch 2.8.0 pin lives, and where a mis-resolution is most likely.
 # The two model-family environments no longer exist, so neither has pins to
 # assert. What replaced those checks is below: an import of each family's package
 # in the ONE environment, which is the claim that now needs holding.
 RUN python -c "import qwen_asr; print('qwen_asr imports in the main environment')" \
     && python -c "import mir_eval.chord, pretty_midi, mido; print('SheetSage2 deps import')"
 
-# A single summary of all three environments, so the build log states plainly
-# what it produced instead of leaving it scattered across three pip transcripts.
+# A single summary of the environment, so the build log states plainly what it
+# produced instead of leaving it scattered across pip transcripts.
 RUN echo "=== installed environment ===" \
     && python -c "import sys, importlib.metadata as m; print('  main  py', sys.version.split()[0], '| torch', m.version('torch'), '| transformers', m.version('transformers'), '| yue2-infer', m.version('yue2-infer'), '| qwen-asr', m.version('qwen-asr'))" \
     && echo "=============================="
 
-# --- the unification experiment -----------------------------------------------------
+# --- the unified-stack guard --------------------------------------------------------
 #
-# Does SheetSage2's code load under YuE2's stack instead of its own pins? If it
-# does, the three environments can collapse into one and the image loses two
-# torch installs. If it does not, the split is required and we will know exactly
-# which import broke.
+# **The experiment is over; its answer is what ships.** SheetSage2's code loads
+# under YuE2's stack — verified on hardware, not just at import — so the image
+# carries ONE environment and the probe below is no longer deciding anything.
 #
-# This RUN is deliberately NON-FATAL. It reports; it does not gate. The split
-# stack is what ships today, so a failure here is information rather than a
-# build error — and making it fatal before we know the answer would mean a red
-# build that says nothing about whether the *product* is broken.
+# It stays because the question it asks is now a standing one: *do SheetSage2's
+# remote-code modules still import under the torch/transformers this image
+# installed?* The model ships `.py` files loaded with `trust_remote_code`, so a
+# future transformers bump can break the cover path without breaking anything
+# this file otherwise checks. That is the failure this catches, at build time,
+# from the Builds tab, before a job pays for it.
+#
+# This RUN is deliberately NON-FATAL, and that is a considered choice rather than
+# leftover caution. The probe fetches SheetSage2's code from the Hub, so making it
+# fatal would let a transient network failure or an HF outage — neither of which
+# says anything about this image — produce a red build. A build that fails for
+# reasons unrelated to the product trains people to ignore red builds.
 #
 # NOT `--offline`. The first version passed it, and that made the probe useless:
 # nothing is cached at this point in the build, so it could never fetch
@@ -245,7 +251,7 @@ RUN echo "=== installed environment ===" \
 #
 # Read the result in the Builds tab: `VERDICT: ...` near the end of this step.
 COPY worker/transcribe_sheetsage/probe_unified_stack.py /tmp/probe_unified_stack.py
-RUN python /tmp/probe_unified_stack.py || echo "probe: unified stack NOT viable (see VERDICT above)"
+RUN python /tmp/probe_unified_stack.py || echo "probe: SheetSage2 does NOT import under this stack (see VERDICT above)"
 
 # Handler code last — it changes most often, so it invalidates the least.
 COPY worker/ /app/
