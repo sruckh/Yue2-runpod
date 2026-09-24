@@ -19,6 +19,7 @@ way to catch plumbing that was never connected.
 
 from __future__ import annotations
 
+import base64
 import importlib
 import sys
 from pathlib import Path
@@ -491,32 +492,137 @@ def test_a_url_that_yields_nothing_is_named_not_silently_returned(
     assert "serves the file directly" in str(caught.value)
 
 
-def test_a_data_uri_is_routed_to_the_sdk_not_treated_as_a_path(
-    handler_module: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A base64 payload is long but is not a path.
+def _sdk_that_refuses_data(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    """A fake SDK with the real one's scheme check.
 
-    The route test used to be `len(source) > 512`, so a base64 URI shorter than
-    that fell through to the local-path branch and was stat()'d as a filename.
+    runpod 1.12's `safe_get` allows only http/https and raises
+    `blocked URL scheme 'data'` for anything else. The earlier fake accepted any
+    scheme, which is how a suite that routed `data:` into the SDK stayed green
+    while every such job failed on the endpoint.
     """
-    served = tmp_path / "decoded"
-    served.write_bytes(_MINIMAL_WAV)
-
     called: dict[str, Any] = {}
 
     def fake_download(job_id: str, urls: list[str]) -> list[str]:
         called["urls"] = urls
-        return [str(served)]
+        for url in urls:
+            scheme = url.split(":", 1)[0]
+            if scheme not in ("http", "https"):
+                raise ValueError(f"blocked URL scheme {scheme!r}: {url[:40]}")
+        return []
 
     fake_utils = type(sys)("runpod.serverless.utils")
     fake_utils.download_files_from_urls = fake_download  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "runpod.serverless.utils", fake_utils)
+    return called
 
-    params = validate_job(cover_job(source_audio="data:audio/wav;base64,UklGRg=="))
-    resolved = handler_module._fetch_source_audio(params, "job-1")
 
-    assert resolved == str(served)
-    assert called["urls"] == ["data:audio/wav;base64,UklGRg=="], "a data: URI must go to the SDK"
+def test_a_data_uri_is_decoded_by_the_worker_not_the_sdk(
+    handler_module: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #1: a base64 `data:` URI is documented input, and the SDK refuses it.
+
+    It is also not a path — the route test once was `len(source) > 512`, so a
+    short base64 URI fell through to the local-path branch and was stat()'d.
+    """
+    monkeypatch.chdir(tmp_path)
+    called = _sdk_that_refuses_data(monkeypatch)
+
+    encoded = base64.b64encode(_MINIMAL_WAV).decode()
+    params = validate_job(cover_job(source_audio=f"data:audio/wav;base64,{encoded}"))
+    resolved = Path(handler_module._fetch_source_audio(params, "job-1"))
+
+    assert "urls" not in called, "a data: URI must not reach the SDK, which blocks the scheme"
+    assert resolved.read_bytes() == _MINIMAL_WAV
+    # The SDK's scratch location, not the workdir: the workdir is uploaded.
+    assert resolved.parent == tmp_path / "jobs" / "job-1" / "downloaded_files"
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("data:audio/wav;base64", "no ','"),
+        ("data:audio/wav,RIFF", "not base64-encoded"),
+        ("data:audio/wav;base64,not*base64!", "not valid base64"),
+        ("data:audio/wav;base64,", "empty payload"),
+    ],
+)
+def test_a_malformed_data_uri_is_named(
+    handler_module: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: str, expected: str
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _sdk_that_refuses_data(monkeypatch)
+
+    params = validate_job(cover_job(source_audio=source))
+    with pytest.raises(handler_module.WorkerError, match=expected):
+        handler_module._fetch_source_audio(params, "job-1")
+
+
+def test_a_data_uri_that_is_not_audio_is_refused_before_the_model(
+    handler_module: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Decoded bytes go through the same `audio_probe` check as a download."""
+    monkeypatch.chdir(tmp_path)
+    _sdk_that_refuses_data(monkeypatch)
+
+    page = base64.b64encode(b"<!DOCTYPE html><html><body>Not found</body></html>").decode()
+    params = validate_job(cover_job(source_audio=f"data:audio/wav;base64,{page}"))
+    with pytest.raises(handler_module.WorkerError, match="not a decodable audio file"):
+        handler_module._fetch_source_audio(params, "job-1")
+
+
+@pytest.mark.parametrize("fails", [False, True], ids=["success", "failure"])
+def test_a_cover_job_leaves_nothing_on_the_container_disk(
+    handler_module: Any, storage: Storage, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fails: bool
+) -> None:
+    """`jobs/<job_id>` is off the volume, so it is removed on every exit path.
+
+    The SDK's `clean()` does not touch `jobs/`; before this, each cover's source
+    recording stayed on the container disk until the worker was recycled.
+    """
+    import modes
+
+    monkeypatch.chdir(tmp_path)
+    _sdk_that_refuses_data(monkeypatch)
+
+    seen: dict[str, Any] = {}
+
+    def fake_dispatch(mode: str, p: Any, workdir: Path) -> Any:
+        seen["source"] = Path(p.source_audio)
+        seen["existed"] = seen["source"].exists()
+        if fails:
+            raise modes.ModeError("transcription failed")
+        return modes.ModeResult(mode=mode, score_abc=None, lyrics="from asr")
+
+    monkeypatch.setattr(handler_module.modes, "dispatch", fake_dispatch)
+
+    encoded = base64.b64encode(_MINIMAL_WAV).decode()
+    job = {**cover_job(source_audio=f"data:audio/wav;base64,{encoded}"), "id": "job-7"}
+    result = handler_module.run_create_job(job, storage=storage, config=None)
+
+    assert seen["existed"], "the mode must receive a file that exists"
+    assert ("error" in result) is fails
+    assert not (tmp_path / "jobs" / "job-7").exists()
+    assert not seen["source"].exists()
+
+
+@pytest.mark.parametrize("job_id", ["", ".", "..", "../elsewhere", "a/b"])
+def test_download_cleanup_never_reaches_outside_its_own_job(
+    handler_module: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, job_id: str
+) -> None:
+    """The id is caller-influenced; it must not turn the delete into `rm -r jobs/` or worse."""
+    monkeypatch.chdir(tmp_path)
+    sibling = tmp_path / "jobs" / "other-job" / "downloaded_files" / "keep"
+    sibling.parent.mkdir(parents=True)
+    sibling.write_bytes(b"x")
+    outside = tmp_path / "elsewhere" / "keep"
+    outside.parent.mkdir()
+    outside.write_bytes(b"x")
+    (tmp_path / "jobs" / "a" / "b").mkdir(parents=True)
+
+    handler_module._cleanup_job_downloads(job_id)
+
+    assert sibling.exists()
+    assert outside.exists()
 
 
 def test_real_audio_still_passes_through_the_handler(

@@ -26,6 +26,8 @@ Running standalone (outside RunPod) uses the bar's own convention: pass
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import logging
 import os
@@ -315,9 +317,12 @@ def _fetch_source_audio(params: SongParameters, job_id: str) -> str:
     """Download a cover job's source recording to the container's disk.
 
     `source_audio` arrives as a URL (or a base64 payload) and the mode pipelines
-    need a local path. RunPod's own `download_files_from_urls` is used rather
-    than a hand-rolled fetch — it is what the reference workers use, and it
-    handles the base64 case, the job's scratch directory and cleanup.
+    need a local path. An `http(s)://` URL goes through RunPod's own
+    `download_files_from_urls` rather than a hand-rolled fetch — it is what the
+    reference workers use, and it brings the SDK's SSRF guard and size cap. A
+    base64 `data:` URI is decoded here instead: the SDK's fetch allows only
+    `http`/`https` and refuses `data` outright ("blocked URL scheme 'data'"), so
+    handing it one fails every such job.
 
     **The result is identified before it is returned.** A URL that serves an HTML
     error page, a JSON envelope or nothing at all decodes as far as SheetSage2 is
@@ -333,13 +338,14 @@ def _fetch_source_audio(params: SongParameters, job_id: str) -> str:
     if not source:
         raise WorkerError("cover mode: no source_audio on the validated request")
 
-    if source.startswith("http://") or source.startswith("https://") or source.startswith("data:"):
+    if source.startswith("data:"):
+        path = _decode_data_uri(source, job_id)
+    elif source.startswith("http://") or source.startswith("https://"):
         try:
             from runpod.serverless.utils import download_files_from_urls
         except ImportError as exc:  # pragma: no cover - the image always has runpod
             raise WorkerError("cover mode: runpod SDK is unavailable, so the source audio cannot be fetched") from exc
         try:
-            # A data: URI is long; a URL is not. The SDK accepts both.
             downloaded = download_files_from_urls(job_id, [source])
         except Exception as exc:
             raise WorkerError(f"cover mode: could not fetch source_audio — {exc}") from exc
@@ -353,9 +359,8 @@ def _fetch_source_audio(params: SongParameters, job_id: str) -> str:
         # Already a path on disk.
         path = source
 
-    # Same check on both routes. A base64 `data:` URI is decoded by the SDK into
-    # a temporary path this code never sees, and a locally-supplied path can be
-    # wrong too — whether the bytes are audio is the question either way.
+    # Same check on every route. A `data:` payload is whatever the caller
+    # encoded, and a locally-supplied path can be wrong too — whether the bytes are audio is the question either way.
     found = audio_probe.probe(Path(path))
     if found.is_known_non_audio:
         # The remedy differs by kind, so the message names it. A cut-off download
@@ -375,6 +380,44 @@ def _fetch_source_audio(params: SongParameters, job_id: str) -> str:
 
     log.info("cover mode: source audio %s (%s)", found.kind, found.describe())
     return path
+
+
+def _decode_data_uri(source: str, job_id: str) -> str:
+    """Write a base64 `data:` URI's bytes to disk and return the path.
+
+    The file lands where the SDK puts downloads — `jobs/<job_id>/downloaded_files/`
+    — and deliberately not in the job's workdir: that whole directory is
+    uploaded to storage, and the caller's recording is not an artifact.
+
+    Only the base64 form is accepted. A `data:` URI without `;base64` is
+    percent-encoded text, which is never a recording, so it is named here rather
+    than handed to the decoder to fail on later.
+    """
+    header, sep, payload = source.partition(",")
+    if not sep:
+        raise WorkerError("cover mode: source_audio is a data: URI with no ',' — expected data:<mime>;base64,<payload>")
+    if ";base64" not in header.lower():
+        raise WorkerError(
+            f"cover mode: source_audio data: URI is not base64-encoded ({header[:80]}) — "
+            "expected data:<mime>;base64,<payload>"
+        )
+    try:
+        # Strict: a payload with stray characters is a mangled upload, and
+        # silently skipping them would hand the decoder a corrupted file.
+        audio = base64.b64decode("".join(payload.split()), validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise WorkerError(f"cover mode: source_audio data: URI is not valid base64 — {exc}") from exc
+    if not audio:
+        raise WorkerError("cover mode: source_audio data: URI has an empty payload")
+
+    directory = _job_downloads_root(job_id) / "downloaded_files"
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / str(uuid.uuid4())
+        path.write_bytes(audio)
+    except OSError as exc:
+        raise WorkerError(f"cover mode: could not write the decoded source_audio to disk — {exc}") from exc
+    return str(path)
 
 
 def run_create_job(
@@ -492,6 +535,10 @@ def run_create_job(
         return {"error": str(exc), "vram": vram.to_dict()}
     finally:
         _cleanup(workdir)
+        # The cover source (SDK download or decoded data: URI) sits on the
+        # container disk, which does not survive a restart — nothing there is
+        # worth keeping, and it accumulates one recording per cover job.
+        _cleanup_job_downloads(job_id)
 
     log.info("job %s complete: %s", job_id, response["audio_url"])
     return response
@@ -537,6 +584,28 @@ def _cleanup(path: Path) -> None:
     latent arrays will fill it. The volume keeps the durable copies.
     """
     shutil.rmtree(path, ignore_errors=True)
+
+
+def _job_downloads_root(job_id: str) -> Path:
+    """`jobs/<job_id>`, where `download_files_from_urls` writes — relative to the
+    working directory, which is `/app` on the container disk, not the volume."""
+    return Path("jobs", job_id).resolve()
+
+
+def _cleanup_job_downloads(job_id: str) -> None:
+    """Remove this job's `jobs/<job_id>` and nothing else.
+
+    `job_id` comes from the job payload, so the resolved path is checked to be a
+    child of `jobs/` — an id of `""`, `.` or `../x` must not widen the delete.
+    The SDK's own `clean()` does not touch `jobs/`, so without this every cover
+    source stays on the container disk until the worker is recycled.
+    """
+    root = Path("jobs").resolve()
+    target = _job_downloads_root(job_id)
+    if target.parent != root:
+        log.warning("job %s: not removing %s — outside %s", job_id, target, root)
+        return
+    _cleanup(target)
 
 
 @contextmanager
